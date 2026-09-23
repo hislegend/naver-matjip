@@ -1,6 +1,6 @@
 # naver-matjip 🍜
 
-**"맛집 추천해줘" 하면 블로그 긁어서 대충 걸리는 데 말고, 숫자로 거른 곳을 3초 만에.**
+**"맛집 추천해줘" 하면 블로그 긁어서 대충 걸리는 데 말고 — 숫자로 거르고, Jev가 0.4초에 골라준 곳을 5초 만에.**
 
 네이버 플레이스의 방문자 키워드 투표에서 **"음식이 맛있어요" 표가 2등 키워드의 2배 이상**인 식당만 추립니다.
 인테리어·친절·뷰 때문이 아니라 **맛 때문에** 표가 몰린 집입니다.
@@ -9,16 +9,48 @@
 Claude Code · Codex(GPT) · Claude Desktop · Cursor 등 **MCP를 지원하는 모든 에이전트**, 또는 그냥 터미널에서 씁니다.
 
 ```
-$ python3 matjip.py 을지로 --type 한식
-을지로 한식 — 22곳 조회, 맛 투표 100표 이상 & 2위 키워드의 2배 이상 = 4곳 (4.9초)
-Jev 미연결(키 없음) — 숫자 기준만 적용
-1. 골수 (감자탕) — 음식이 맛있어요 570 / 2위 263 = 2.2배 · 별점 4.87
-   https://m.place.naver.com/restaurant/1724618660/home
-2. 주도락 을지로점 (요리주점) — 음식이 맛있어요 1427 / 2위 669 = 2.1배 · 별점 4.9
+$ python3 matjip.py 을지로 --type 한식 --want "조용히 대화하기 좋은 곳"
+을지로 한식 — 23곳 조회, 맛 투표 100표 이상 & 2위 키워드의 2배 이상 = 4곳 (5.2초)
+Jev 판정 적용 — 조건: 조용히 대화하기 좋은 곳
+1. 주도락 을지로점 (요리주점) — 음식이 맛있어요 1427 / 2위 669 = 2.1배 · 별점 4.9 · 조건적합 3.1/4
    https://m.place.naver.com/restaurant/2083227216/home
-3. 고봉당 을지로점 (한식) — 음식이 맛있어요 622 / 2위 308 = 2.0배 · 별점 4.95
+2. 고봉당 을지로점 (한식) — 음식이 맛있어요 622 / 2위 308 = 2.0배 · 별점 4.95 · 조건적합 1.9/4
    https://m.place.naver.com/restaurant/2064119908/home
+3. 골수 (감자탕) — 음식이 맛있어요 570 / 2위 263 = 2.2배 · 별점 4.87 · 조건적합 1.8/4
+   https://m.place.naver.com/restaurant/1724618660/home
+(투표 100표 미만이라 제외: 4곳)
 ```
+
+## Jev가 하는 일 — 같은 4곳, 조건만 바꿨더니 순서가 바뀐다
+
+숫자는 "맛있다"까지만 압니다. **"조용한가? 10명이 앉나? 데이트 분위기인가?"는 리뷰를 읽어야** 압니다.
+이 부분을 [TypeSafe Jev](https://docs.typesafe.ai)가 맡습니다.
+
+아래는 을지로 한식에서 숫자 기준을 통과한 **똑같은 4곳**에 조건만 바꿔 물은 실제 결과입니다 (2026-09-23 실측, 4점 만점).
+
+| 식당 | 🤫 "조용히 대화하기 좋은 곳" | 🍻 "10명 회식하기 좋은 곳" |
+|---|---|---|
+| 주도락 을지로점 (요리주점) | **3.1 · 1위** | **3.6 · 공동 1위** |
+| 고봉당 을지로점 (한식) | 1.9 · 2위 | 2.4 · 4위 |
+| 골수 (감자탕) | 1.8 · 3위 | 3.0 · 3위 |
+| 청기와타운 을지로점 (고기집) | 1.7 · **4위** | **3.6 · 공동 1위** |
+
+- 고기집은 "조용히"에선 꼴찌, "회식"에선 1위. 리뷰 키워드에 `단체모임 하기 좋아요`가 있는 집입니다.
+- 주도락은 `매장이 넓어요` 키워드가 상위이고 리뷰에 "가게도 넓고 쾌적해요" 같은 말이 있어 두 조건 모두 위에 섰습니다.
+- 성수동 "분위기 좋은 데이트"에선 맛 다음 표가 `인테리어가 멋져요`인 연남토마가 3.8점으로 1위.
+
+### 왜 LLM이 아니라 Jev인가
+
+| | 실측값 |
+|---|---|
+| 판정 속도 | 식당 4곳 × 질문 2개 **한 번에 0.36~0.41초** (5회 측정) |
+| 비용 | 후보 4곳 요청 = 입력 약 5,000토큰 → **약 $0.0002 (0.3원)**. 후보 20곳이어도 1원 남짓 |
+| 출력 | 글을 생성하지 않음. **점수·확률만** 돌려주므로 파싱 실패가 없음 |
+| 환각 | 후보는 코드가 네이버에서 가져온 것만. Jev는 **고르기만** 하므로 없는 식당을 지어낼 수 없음 |
+| 확신도 | 판정마다 신뢰도(이번 실측 0.66~0.79)가 같이 옴 → 애매하면 사람에게 넘기는 식으로 쓸 수 있음 |
+
+에이전트(Claude·GPT)는 대화와 설명을 하고, 판정은 Jev가 0.4초에 끝냅니다.
+**비싼 LLM을 깨우지 않고 "이 중 뭐가 맞나"를 푸는 자리** — 그게 Jev의 자리입니다.
 
 ## 어떻게 고르나
 
@@ -93,11 +125,11 @@ mkdir -p ~/.config/jev && echo '...' > ~/.config/jev/api_key && chmod 600 ~/.con
 - 네이버 화면 구조가 바뀌면 조회가 깨질 수 있습니다. "0곳 조회"가 나오면 이슈로 알려주세요.
 - 검색 첫 화면 기준이라 동네 전체를 훑지는 않습니다.
 - 투표가 적은 집(100표 미만)은 숫자가 흔들려서 제외합니다.
-- Jev 판정 품질은 아직 이 용도로 충분히 검증되지 않았습니다. 조건 적합도는 참고 신호로 보세요.
+- Jev 판정은 소수 사례로 확인했을 뿐 대규모 검증은 아직입니다. 특히 협찬 리뷰 판별은 실측에서 걸린 사례가 없어 탐지력이 검증되지 않았습니다. 조건 적합도는 참고 신호로 보세요.
 
 ## English
 
-Korean restaurant finder for AI agents. It reads Naver Place visitor keyword votes and keeps places whose "the food is delicious" votes are at least 2× the runner-up keyword (min. 100 votes). With a TypeSafe Jev API key, Jev scores each candidate against your request ("quiet place to talk") and flags sponsored-review-heavy places. Works as a Claude Code plugin, a Codex/any-MCP stdio server, or a plain CLI. Stdlib Python only. Unofficial; not affiliated with Naver — keep usage light and personal.
+Korean restaurant finder for AI agents. It reads Naver Place visitor keyword votes and keeps places whose "the food is delicious" votes are at least 2× the runner-up keyword (min. 100 votes). With a TypeSafe Jev API key, Jev reads the reviews and re-ranks candidates for your request — same 4 places, "quiet place to talk" vs "dinner for 10" produce different orders — in ~0.4 s and ~$0.0002 per request, returning scores instead of generated text, so it can't invent restaurants. Works as a Claude Code plugin, a Codex/any-MCP stdio server, or a plain CLI. Stdlib Python only. Unofficial; not affiliated with Naver — keep usage light and personal.
 
 ## License
 
