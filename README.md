@@ -3,20 +3,27 @@
 **"맛집 추천해줘" 하면 블로그 긁어서 대충 걸리는 데 말고 — 네이버 방문자 100곳의 투표를 세고, Jev가 당신의 말을 키워드로 바꿔 골라줍니다. 4초.**
 
 - **맛 검증**: 네이버 플레이스 방문자 키워드 투표에서 **"음식이 맛있어요" 표가 2등 키워드의 2배 이상**인 집만 남깁니다. 인테리어·친절·뷰가 아니라 **맛 때문에** 표가 몰린 집입니다.
-- **조건 맞춤**: "조용히 대화하기 좋은 곳", "10명 회식", "혼자 한 끼" 같은 말을 [TypeSafe Jev](https://docs.typesafe.ai)가 **네이버 키워드로 번역**하고, 코드가 그 키워드에 몰린 표를 셉니다. 결과마다 **"대화하기 좋아요 89표"** 같은 근거가 붙습니다.
+- **조건 맞춤**: "조용히 대화하기 좋은 곳", "10명 회식", "혼자 한 끼" 같은 말을 [TypeSafe Jev](https://docs.typesafe.ai)가 **네이버 키워드로 번역**하고, 코드가 그 키워드에 몰린 표를 셉니다. 결과마다 **"대화하기 좋아요 89표"** 같은 근거가 붙습니다. 반대 키워드("조용한 곳"인데 `라이브공연이 훌륭해요`)는 감점합니다.
+- **메뉴·영업·가격**: "크림파스타" → 리뷰 메뉴 언급 수로 거르기(`크림파스타 432회`), 지금 영업 중인 곳만, 가격대 상한.
+- **한국어 채점표로 검증**: 조건 문장 30개 채점 — 필수 키워드 재현율 **95%**, 1순위 적중 **97%** ([eval/](eval/)).
 - **어디서나**: Claude Code · Codex(GPT) · Claude Desktop · Cursor 등 **MCP를 지원하는 모든 에이전트**, 또는 터미널. 파이썬 표준 라이브러리만 씁니다.
 
 ```
 $ python3 matjip.py 을지로 --type 한식 --want "조용히 대화하기 좋은 곳"
-을지로 한식 맛집 — 네이버 4,790곳 중 상위 100곳 조회, 맛 투표 100표 이상 & 2위 키워드의 2배 이상 = 35곳 (4.0초)
-Jev 판정 적용(35곳) — '조용히 대화하기 좋은 곳' → 차분한 분위기예요(0.70), 대화하기 좋아요(0.63), 룸이 잘 되어있어요(0.45), 집중하기 좋아요(0.26)
-1. 고봉당 을지로점 (한식) — 음식이 맛있어요 622 / 2위 308 = 2.0배 · 별점 4.95 · 근거: 아늑해요 102표, 차분한 분위기예요 91표, 대화하기 좋아요 89표
-   https://m.place.naver.com/restaurant/2064119908/home
-2. 장작집 을지로점 (한식) — 음식이 맛있어요 155 / 2위 70 = 2.2배 · 별점 4.7 · 근거: 대화하기 좋아요 31표
-   https://m.place.naver.com/restaurant/1397313807/home
-3. 용광쭈꾸미 을지로본점 (한식) — 음식이 맛있어요 4472 / 2위 1527 = 2.9배 · 별점 4.87 · 근거: 대화하기 좋아요 738표, 아늑해요 83표, 차분한 분위기예요 11표
-   https://m.place.naver.com/restaurant/1030835435/home
-(투표 100표 미만이라 제외: 9곳)
+을지로 한식 맛집 — 네이버 4,790곳 중 상위 100곳(캐시) → 통과 35곳 (2.1초)
+기준: 맛 투표 100표 이상 & 2위 키워드의 2배 이상
+Jev 판정 적용(35곳)
+'조용히 대화하기 좋은 곳' → 차분한 분위기예요(0.71), 대화하기 좋아요(0.64), 룸이 잘 되어있어요(0.45), 집중하기 좋아요(0.29) / 반대: 파티하기 좋아요, 라이브공연이 훌륭해요, 단체모임 하기 좋아요
+1. 고봉당 을지로점 (한식) · 종합 67점 — 음식이 맛있어요 2.0배 · 별점 4.95
+   근거: 아늑해요 102표, 차분한 분위기예요 91표, 대화하기 좋아요 89표 · 감점: 단체모임 하기 좋아요 109표, 음악이 좋아요 67표
+   영업 종료 · 5만원 대 · https://m.place.naver.com/restaurant/2064119908/home
+2. 용광쭈꾸미 을지로본점 (한식) · 종합 58점 — 음식이 맛있어요 2.9배 · 별점 4.87
+   근거: 대화하기 좋아요 738표, 아늑해요 83표, 차분한 분위기예요 11표 · 감점: 음악이 좋아요 804표, 단체모임 하기 좋아요 328표
+   영업 종료 · 5만원 대 · https://m.place.naver.com/restaurant/1030835435/home
+3. 장작집 을지로점 (한식) · 종합 52점 — 음식이 맛있어요 2.2배 · 별점 4.7
+   근거: 대화하기 좋아요 31표 · 감점: 음악이 좋아요 45표, 단체모임 하기 좋아요 16표
+   곧 영업 종료 · 5만원 대 · https://m.place.naver.com/restaurant/1397313807/home
+(제외: 투표 적음 10곳)
 ```
 
 ## Jev가 하는 일 — 당신의 말을 네이버 키워드로 바꾼다
@@ -65,13 +72,37 @@ Jev 판정 적용(35곳) — '조용히 대화하기 좋은 곳' → 차분한 �
 
 ## 어떻게 동작하나
 
-1. **목록** — 네이버 플레이스(지도)에서 "`지역` `음식종류` 맛집"으로 상위 100곳(`--max-places`)을 가져옵니다. 50곳씩 한 요청에 묶어 2회.
-2. **맛 필터** — 25곳씩 묶어 방문자 키워드 투표를 가져오고(4회), `…맛있어요` 표가 **100표 이상 & 2등 키워드의 2배 이상**인 곳만 남깁니다 (`--min-votes`, `--ratio`). 카페·빵집은 `커피가/빵이/디저트가 맛있어요`로 봅니다.
-3. **조건 맞춤** (`--want`, Jev 키 필요) — Jev가 조건을 키워드로 번역 → 코드가 키워드 표 비중으로 정렬.
-4. **협찬 판정** (Jev 키 필요) — 통과한 곳의 최근 리뷰를 한 요청으로 가져와 식당별로 판정.
+1. **목록** — 네이버 플레이스(지도)에서 "`지역` `음식종류 또는 메뉴` 맛집"으로 상위 100곳(`--max-places`, 최대 200)을 가져옵니다. 50곳씩 묶어 2회.
+2. **거르기** (코드) — 25곳씩 묶어 방문자 키워드·메뉴 언급을 가져오고(4회), 다음을 통과한 곳만 남깁니다.
+   - 맛: `…맛있어요` 표 **100표 이상 & 2등 키워드의 2배 이상** (`--min-votes`, `--ratio`). 카페·빵집은 `커피가/빵이/디저트가 맛있어요`.
+   - `--open-now`: 네이버 표시가 `영업 중`·`곧 영업 종료`·`24시간 영업`인 곳만.
+   - `--max-price 3`: 네이버 지도의 가격대 표시가 `3만원 대` 이하인 곳만(표시 없는 곳은 남김).
+3. **조건 번역** (`--want`, Jev) — 네이버 키워드 전체에 대해 "이 키워드가 조건의 근거인가 / 반대 근거인가"를 **한 요청**에 묻습니다(투기적 팬아웃). 근거 키워드 표 비중은 가산, 반대 키워드 표 비중은 감점.
+4. **애매한 조건** (Jev) — 가장 관련 있는 키워드도 0.5 미만이면(예: "외국인 친구 데려갈 곳", "비 오는 날") 식당마다 **리뷰 문장만** 보내 근거가 있는지 한 번 더 묻습니다. 리뷰 전체가 아니라 문장 단위로 주는 이유는 무관한 내용이 섞이면 Jev 정확도가 떨어지기 때문입니다(공식 한계).
+5. **메뉴** (`--menu`, Jev) — 후보들의 리뷰 메뉴 라벨 중 찾는 메뉴에 해당하는 것을 Jev가 고르고(예: 크림파스타 → 명란크림파스타·크림파스타·파스타), 코드가 언급 수를 셉니다. 언급 3회 미만은 제외.
+6. **협찬 판정** (Jev) — 통과한 곳의 최근 리뷰로 체험단·협찬 위주인지 판정. 0.7 이상이면 점수 ×0.6.
+7. **종합 점수** (코드) — 맛 배수·별점·표 규모·조건·리뷰 문장·메뉴를 가중합(0~100)하고 반대 감점을 뺍니다. 가중치는 `matjip.py` 의 `WEIGHTS` 한 곳에 있습니다.
 
-Jev 키가 없거나 Jev가 응답하지 않으면 2단계 결과를 그대로 냅니다. 추천이 멈추지 않습니다.
-네이버 요청은 한 번 추천에 **7~8회**(묶음 요청)입니다.
+Jev 키가 없거나 Jev가 응답하지 않으면 2단계 결과를 맛·별점·표 규모 점수로 냅니다. 추천이 멈추지 않습니다.
+같은 검색은 **24시간 캐시**(`~/.cache/naver-matjip`, 끄려면 `NAVER_MATJIP_NO_CACHE=1`)해서 네이버에 다시 묻지 않습니다. 캐시가 없을 때 네이버 요청은 한 번 추천에 **7~8회**(묶음 요청)입니다.
+
+## 한국어 채점표 (eval/)
+
+TypeSafe는 한국어를 영어만큼 잘한다고 보장하지 않습니다. 그래서 조건 문장 30개와 정답 키워드를 만들어 번역 정확도를 잽니다.
+
+```
+$ python3 eval/run_eval.py --repeat 2
+[1] must 재현율 95% · 1순위 적중 97% · 오답 선택 4개 · 반대 탐지 75% · 반대 오탐 0개  (30문항)
+[2] must 재현율 95% · 1순위 적중 97% · 오답 선택 4개 · 반대 탐지 75% · 반대 오탐 0개  (30문항)
+```
+
+- **must 재현율**: 꼭 골라야 할 키워드를 관련 확률 0.5 이상으로 고른 비율
+- **1순위 적중**: 가장 높게 본 키워드가 정답 목록 안에 있는 비율
+- **오답 선택**: 0.5 이상으로 골랐는데 정답 목록 밖인 키워드 수(30문항 합계). 예: "아이랑" → `반려동물과 가기 좋아요`도 고름
+- **반대 탐지**: 반대 키워드(예: "혼자 한 끼" ↔ `단체모임 하기 좋아요`)를 잡은 비율. 실행마다 75~90% 사이로 움직입니다
+- **반대 오탐**: 좋은 키워드를 반대로 잘못 본 수. 0개
+
+반대 판정 기준(0.6)은 채점표로 정했습니다: 0.5면 탐지 90%지만 과잉 판정이 37개, 0.6이면 80%·17개, 0.7이면 50%·8개.
 
 ## 설치
 
@@ -105,7 +136,7 @@ cp -R ~/naver-matjip/skills/naver-matjip ~/.codex/skills/   # 스킬도 쓰려�
 }
 ```
 
-도구 이름은 `recommend_restaurants` (인자: `area`, `food_type`, `want`, `min_votes`, `ratio`, `top`).
+도구 이름은 `recommend_restaurants` (인자: `area`, `food_type`, `want`, `menu`, `open_now`, `max_price`, `min_votes`, `ratio`, `top`, `max_places`).
 결과는 사람이 읽는 텍스트와 구조화된 JSON(`structuredContent`)을 함께 돌려줍니다. 인자 `max_places`(기본 100, 최대 200)로 조회 범위를 바꿀 수 있습니다.
 
 ### 터미널에서 바로
@@ -113,6 +144,8 @@ cp -R ~/naver-matjip/skills/naver-matjip ~/.codex/skills/   # 스킬도 쓰려�
 ```bash
 python3 skills/naver-matjip/scripts/matjip.py 성수동
 python3 skills/naver-matjip/scripts/matjip.py 을지로 --type 한식 --want "조용히 대화하기 좋은 곳"
+python3 skills/naver-matjip/scripts/matjip.py 성수동 --menu 크림파스타 --max-price 3
+python3 skills/naver-matjip/scripts/matjip.py 강남역 --type 고깃집 --want "10명 회식" --open-now
 python3 skills/naver-matjip/scripts/matjip.py 강남역 --json
 ```
 
@@ -134,11 +167,13 @@ mkdir -p ~/.config/jev && echo '...' > ~/.config/jev/api_key && chmod 600 ~/.con
 - 네이버 지도의 내부 데이터 통로를 씁니다. 네이버가 이를 바꾸거나 막으면 조회가 깨질 수 있습니다. 요청이 많으면 `429`(요청 과다)가 날 수 있어 잠시 쉬었다 두 번까지 다시 시도합니다.
 - 조회 범위는 검색 상위 100곳(최대 200)입니다. 동네 전체를 훑지는 않습니다.
 - 투표가 적은 집(100표 미만)은 숫자가 흔들려서 제외합니다.
+- **가격대는 대략적입니다.** 네이버 지도가 붙인 가격대 표시(`priceCategory`)를 그대로 씁니다. 1인 기준인지 확인하지 못했고, 실제보다 높게 붙은 경우(국수집이 `7만원 대`)가 있습니다.
+- 애매한 조건의 리뷰 문장 판정은 놓치는 경우가 있습니다(실측: "외국 친구들 맛 보여주려고" 문장이 있는 집을 0.04로 봄).
 - 키워드 번역 확률은 호출마다 조금씩(±0.02 정도) 달라질 수 있습니다. 조건 순위는 참고 신호로 보세요.
 
 ## English
 
-Korean restaurant finder for AI agents. It pulls the top 100 places for an area from Naver Place and keeps those whose "the food is delicious" visitor votes are at least 2× the runner-up keyword (min. 100 votes). With a TypeSafe Jev API key, Jev translates your request ("quiet place to talk", "dinner for 10") into Naver's visitor-keyword vocabulary in ~0.4 s, and the code ranks candidates by the share of votes on those keywords — so every result comes with vote-count evidence. Jev also flags sponsored-review-heavy places. Works as a Claude Code plugin, a Codex/any-MCP stdio server, or a plain CLI. Stdlib Python only. Unofficial; not affiliated with Naver — keep usage light and personal.
+Korean restaurant finder for AI agents (filters: menu mentions, open now, price range; composite score with opposite-keyword penalty; 30-case Korean eval: 95% recall, 97% top-1). It pulls the top 100 places for an area from Naver Place and keeps those whose "the food is delicious" visitor votes are at least 2× the runner-up keyword (min. 100 votes). With a TypeSafe Jev API key, Jev translates your request ("quiet place to talk", "dinner for 10") into Naver's visitor-keyword vocabulary in ~0.4 s, and the code ranks candidates by the share of votes on those keywords — so every result comes with vote-count evidence. Jev also flags sponsored-review-heavy places. Works as a Claude Code plugin, a Codex/any-MCP stdio server, or a plain CLI. Stdlib Python only. Unofficial; not affiliated with Naver — keep usage light and personal.
 
 ## License
 

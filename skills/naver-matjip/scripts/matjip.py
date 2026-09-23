@@ -16,7 +16,7 @@
 주의: 네이버 약관상 자동 수집 제약이 있다. 사용자 요청 1건당 1~2회만 실행하고,
       반복 실행·대량 조회에 쓰지 않는다.
 """
-import argparse, concurrent.futures as cf, json, os, sys, time
+import argparse, concurrent.futures as cf, hashlib, json, math, os, re, sys, time
 import urllib.error, urllib.request
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -29,10 +29,10 @@ JEV_URL = os.environ.get("JEV_API_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_KEY_FILE = os.path.expanduser("~/.config/jev/api_key")
 
 Q_LIST = ("query getRestaurants($input: RestaurantListInput) { restaurants: restaurantList(input: $input) "
-          "{ total items { id name category visitorReviewCount } } }")
+          "{ total items { id name category priceCategory roadAddress newBusinessHours { status description } } } }")
 Q_STATS = ("query stats($id: String, $businessType: String) { visitorReviewStats(input: "
            "{businessId: $id, businessType: $businessType}) { id review { avgRating totalCount } "
-           "analysis { votedKeyword { details { displayName count } } } } }")
+           "analysis { votedKeyword { details { displayName count } } menus { label count } } } }")
 Q_REVIEWS = ("query reviews($input: VisitorReviewsInput) { visitorReviews(input: $input) "
              "{ items { body } } }")
 
@@ -52,6 +52,49 @@ def gql(ops, timeout=20):
                 time.sleep(2.0 * (attempt + 1))
                 continue
             raise
+
+
+CACHE_DIR = os.path.expanduser(os.environ.get("NAVER_MATJIP_CACHE", "~/.cache/naver-matjip"))
+CACHE_TTL = 24 * 3600
+
+
+def cache_get(name):
+    if os.environ.get("NAVER_MATJIP_NO_CACHE"):
+        return None
+    f = os.path.join(CACHE_DIR, name + ".json")
+    try:
+        if time.time() - os.path.getmtime(f) < CACHE_TTL:
+            return json.load(open(f))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def cache_put(name, value):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = os.path.join(CACHE_DIR, name + ".tmp")
+        json.dump(value, open(tmp, "w"), ensure_ascii=False)
+        os.replace(tmp, os.path.join(CACHE_DIR, name + ".json"))
+    except OSError:
+        pass
+
+
+def cache_key(*parts):
+    return hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:16]
+
+
+def load_places(query, limit):
+    """목록 + 키워드·메뉴 통계. 24시간 캐시. (total, places, from_cache)"""
+    name = "places-" + cache_key(query, limit)
+    hit = cache_get(name)
+    if hit:
+        return hit["total"], hit["places"], True
+    total, places = list_places(query, limit)
+    if places:
+        fetch_stats(places)
+        cache_put(name, {"total": total, "places": places})
+    return total, places, False
 
 
 def list_places(query, limit):
@@ -86,12 +129,21 @@ def fetch_stats(places):
                 st = ((r.get("data") or {}).get("visitorReviewStats") or {})
                 kw = (((st.get("analysis") or {}).get("votedKeyword") or {}).get("details")) or []
                 p["keywords"] = [(k["displayName"], int(k["count"])) for k in kw]
+                p["menus"] = [(m["label"], int(m["count"])) for m in ((st.get("analysis") or {}).get("menus") or [])]
                 p["rating"] = (st.get("review") or {}).get("avgRating")
                 p["review_total"] = (st.get("review") or {}).get("totalCount")
 
 
 def fetch_reviews(places, size=30):
-    """최근 방문자 리뷰 본문을 한 요청으로 가져와 places 에 채운다(Jev 판정용)."""
+    """최근 방문자 리뷰 본문을 한 요청으로 가져와 places 에 채운다(Jev 판정용). 식당별 24시간 캐시."""
+    todo = []
+    for p in places:
+        hit = cache_get("reviews-" + p["id"])
+        if hit is not None:
+            p["reviews"] = hit
+        else:
+            todo.append(p)
+    places = todo
     if not places:
         return
     res = gql([{"operationName": "reviews", "query": Q_REVIEWS, "variables": {"input": {
@@ -102,6 +154,7 @@ def fetch_reviews(places, size=30):
         bodies = [i["body"].strip() for i in items if i.get("body")]
         # "맛있어요" 한 줄짜리는 조건 판단 근거가 안 된다 — 긴 리뷰부터 쓴다
         p["reviews"] = sorted([b for b in bodies if len(b) >= 20], key=len, reverse=True)
+        cache_put("reviews-" + p["id"], p["reviews"])
 
 
 def taste_ratio(place):
@@ -138,21 +191,84 @@ def jev_call(state, questions, key):
 
 
 KW_MIN = 0.2   # 조건 관련성이 이 값 미만인 키워드는 무시(잡음)
+OPP_MIN = 0.6  # 반대 근거로 볼 최소 확률 (eval: 0.5=탐지90%·과잉37, 0.6=80%·17, 0.7=50%·8)
+VAGUE = 0.5    # 관련 키워드 최고 확률이 이보다 낮으면 "애매한 조건" → 리뷰 문장 보조 판정
+
+
+def relevance(want, keyword_names, key):
+    """손님의 말(want)과 네이버 방문자 키워드 각각의 관계를 한 요청으로 판정한다(투기적 팬아웃).
+    (관련 {키워드: p}, 반대 {키워드: p})
+    키워드 이름을 질문 문장에 직접 넣는다 — 배열 인덱스로 가리키면 판정이 흐려진다(2026-09-23 실측)."""
+    q = {}
+    for i, n in enumerate(keyword_names):
+        q[f"k{i}"] = {
+            "type": "noul",
+            "instructions": f"식당 방문자들이 '{n}' 라는 키워드를 많이 골랐다. 이 사실이 손님의 요청"
+                            f"(`customer_request`)에 맞는 식당이라는 직접적인 근거인가?",
+            "criteria": {"true": f"'{n}' 는 손님이 원하는 바로 그 특징이다",
+                         "false": f"'{n}' 는 손님 요청과 관계없는 다른 장점이다"},
+        }
+        q[f"o{i}"] = {
+            "type": "noul",
+            "instructions": f"식당 방문자들이 '{n}' 라는 키워드를 많이 골랐다. 이 사실이 손님의 요청"
+                            f"(`customer_request`)과 반대되는 식당, 즉 손님이 피하고 싶어 할 식당이라는 근거인가?",
+            "criteria": {"true": f"'{n}' 가 많은 식당은 손님이 원하는 것과 정반대다",
+                         "false": f"'{n}' 는 손님 요청과 충돌하지 않는다"},
+        }
+    ans = jev_call({"customer_request": want}, q, key)
+    rel = {n: ans[f"k{i}"]["noul"] for i, n in enumerate(keyword_names)}
+    opp = {n: ans[f"o{i}"]["noul"] for i, n in enumerate(keyword_names)}
+    return rel, opp
 
 
 def map_want_to_keywords(want, keyword_names, key):
-    """손님의 말(want)을 네이버 방문자 키워드로 번역한다. {키워드: 관련 확률}.
-    키워드 이름을 질문 문장에 직접 넣는다 — 배열 인덱스로 가리키면 판정이 흐려진다(2026-09-23 실측)."""
-    q = {f"k{i}": {
+    """관련 확률 KW_MIN 이상 키워드(높은 순)와 반대 확률 OPP_MIN 이상 키워드. 관련이 더 크면 반대에서 뺀다."""
+    rel, opp = relevance(want, keyword_names, key)
+    pos = {n: v for n, v in sorted(rel.items(), key=lambda x: -x[1]) if v >= KW_MIN}
+    neg = {n: v for n, v in sorted(opp.items(), key=lambda x: -x[1]) if v >= OPP_MIN and v > rel[n]}
+    return pos, neg
+
+
+def match_menus(menu, labels, key, chunk=150):
+    """손님이 찾는 메뉴(menu)에 해당하는 리뷰 메뉴 라벨을 고른다. {라벨: p}"""
+    labels = sorted(set(labels))
+    out = {}
+
+    def one(part):
+        q = {f"m{i}": {
+            "type": "noul",
+            "instructions": f"리뷰에 '{l}' 라는 메뉴가 언급됐다. 이 메뉴는 손님이 찾는 음식(`wanted_menu`)에 해당하는가?",
+            "criteria": {"true": f"'{l}' 는 손님이 찾는 그 음식이거나 그 음식의 한 종류다",
+                         "false": f"'{l}' 는 다른 음식이다"},
+        } for i, l in enumerate(part)}
+        ans = jev_call({"wanted_menu": menu}, q, key)
+        return {l: ans[f"m{i}"]["noul"] for i, l in enumerate(part)}
+
+    parts = [labels[i:i + chunk] for i in range(0, len(labels), chunk)]
+    with cf.ThreadPoolExecutor(4) as ex:
+        for r in ex.map(one, parts):
+            out.update(r)
+    return {l: v for l, v in out.items() if v >= 0.5}
+
+
+def review_fit(cands, want, key):
+    """조건에 딱 맞는 키워드가 없을 때만 쓰는 보조 판정. 식당마다 '조건과 닿는 리뷰 문장'만 보내
+    근거가 있는지 묻는다(무관한 문장이 섞이면 흐려진다 — 공식 한계 5번). {id: p}"""
+    q = {"fit": {
         "type": "noul",
-        "instructions": f"식당 방문자들이 '{n}' 라는 키워드를 많이 골랐다. 이 사실이 손님의 요청"
-                        f"(`customer_request`)에 맞는 식당이라는 직접적인 근거인가?",
-        "criteria": {"true": f"'{n}' 는 손님이 원하는 바로 그 특징이다",
-                     "false": f"'{n}' 는 손님 요청과 관계없는 다른 장점이다"},
-    } for i, n in enumerate(keyword_names)}
-    ans = jev_call({"customer_request": want}, q, key)
-    rel = {n: ans[f"k{i}"]["noul"] for i, n in enumerate(keyword_names)}
-    return {n: v for n, v in sorted(rel.items(), key=lambda x: -x[1]) if v >= KW_MIN}
+        "instructions": "`review_sentences` 에 이 식당이 손님의 요청(`customer_request`)에 맞는다는 직접적인 근거가 있는가?",
+        "criteria": {"true": "요청한 상황·분위기에 잘 맞았다는 방문자 문장이 있다",
+                     "false": "그런 문장이 없거나, 맞지 않았다는 문장이 있다"},
+    }}
+
+    def one(c):
+        sents = [x.strip() for r in c.get("reviews", []) for x in re.split(r"[.!?\n~]+", r) if len(x.strip()) >= 8]
+        if not sents:
+            return c["id"], None
+        return c["id"], jev_call({"customer_request": want, "review_sentences": sents[:25]}, q, key)["fit"]["noul"]
+
+    with cf.ThreadPoolExecutor(8) as ex:
+        return dict(ex.map(one, cands))
 
 
 def condition_score(place, weights):
@@ -184,97 +300,195 @@ def judge_sponsored(cands, key):
         return dict(ex.map(one, cands))
 
 
-def recommend(area, food_type="", want="", min_votes=100, ratio=2.0, top=5, max_places=100):
-    """조회→1차 숫자 필터→(가능하면) Jev 판정. 결과 dict 를 돌려준다. CLI·MCP 공용."""
+OPEN_STATUSES = ("영업 중", "곧 영업 종료", "24시간 영업")
+# 종합 점수 가중치(코드가 정한다 — 공식 권장 "Composite scoring"). 양수 항목은 쓰이는 것끼리 합이 1이 되게 다시 나눈다.
+WEIGHTS = {"맛": 0.45, "별점": 0.2, "표 규모": 0.15, "조건": 0.5, "리뷰 문장": 0.25, "메뉴": 0.35}
+PENALTY = 0.2          # 반대 키워드 감점 가중치
+SPONSORED_CUT = 0.7    # 협찬 의심 이상이면 점수 ×0.6
+
+
+def price_manwon(cat):
+    """'3만원 대' → 3, '1만원 미만' → 0.9, 없으면 None"""
+    if not cat:
+        return None
+    m = re.search(r"(\d+)\s*만\s*원", cat)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n - 0.1 if "미만" in cat else n
+
+
+def composite(c, maxes, use):
+    """0~100 점과 항목별 기여(점)."""
+    parts = {
+        "맛": min(c["ratio"], 4.0) / 4.0,
+        "별점": min(max(((c.get("rating") or 4.5) - 4.0) / 1.0, 0.0), 1.0),
+        "표 규모": min(max(math.log10(max(c["taste_votes"], 1)) / math.log10(5000), 0.0), 1.0),
+    }
+    if "조건" in use:
+        parts["조건"] = c.get("condition_score", 0) / maxes["조건"] if maxes["조건"] else 0.0
+    if "리뷰 문장" in use:
+        parts["리뷰 문장"] = c.get("review_fit") or 0.0
+    if "메뉴" in use:
+        parts["메뉴"] = c.get("menu_share", 0) / maxes["메뉴"] if maxes["메뉴"] else 0.0
+    wsum = sum(WEIGHTS[k] for k in parts)
+    pts = {k: 100 * WEIGHTS[k] / wsum * v for k, v in parts.items()}
+    total = sum(pts.values())
+    if c.get("opposite_score") and maxes["조건"]:
+        pen = 100 * PENALTY * min(c["opposite_score"] / maxes["조건"], 1.0)
+        pts["반대 감점"] = -pen
+        total -= pen
+    if (c.get("jev_sponsored") or 0) >= SPONSORED_CUT:
+        pts["협찬 의심"] = -0.4 * total
+        total *= 0.6
+    return round(max(total, 0), 1), {k: round(v, 1) for k, v in pts.items()}
+
+
+def recommend(area, food_type="", want="", menu="", open_now=False, max_price=None,
+              min_votes=100, ratio=2.0, top=5, max_places=100):
+    """조회 → 거르기(영업·가격·맛) → Jev(조건·반대·메뉴·협찬) → 종합 점수. CLI·MCP 공용."""
     t0 = time.time()
-    query = f"{area} {food_type} 맛집".replace("  ", " ") if food_type else f"{area} 맛집"
-    errors = []
+    query = " ".join(x for x in (area, food_type or menu, "맛집") if x)
+    errors, notes = [], []
     try:
-        total, places = list_places(query, max_places)
+        total, places, cached = load_places(query, max_places)
     except Exception as e:
-        total, places = 0, []
-        errors.append(f"목록 조회 실패: {type(e).__name__} {e}")
-    if places:
-        try:
-            fetch_stats(places)
-        except Exception as e:
-            errors.append(f"키워드 통계 조회 실패: {type(e).__name__} {e}")
+        total, places, cached = 0, [], False
+        errors.append(f"조회 실패: {type(e).__name__} {e}")
     for p in places:
         p["url"] = f"https://m.place.naver.com/restaurant/{p['id']}/home"
+        p["status"] = ((p.get("newBusinessHours") or {}).get("status")) or None
+        p["price"] = p.get("priceCategory")
 
-    passed, few_votes = [], 0
+    excluded = {"영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "메뉴 언급 없음": 0}
+    passed = []
     for p in places:
+        if open_now and p["status"] not in OPEN_STATUSES:
+            excluded["영업 안 함·정보 없음"] += 1
+            continue
+        pm = price_manwon(p["price"])
+        if max_price is not None and pm is not None and pm > max_price:
+            excluded["가격 초과"] += 1
+            continue
         key, t, rest, r = taste_ratio(p)
         p.update(taste_key=key, taste_votes=t, second_votes=rest, ratio=r)
         if key is None:
             continue
         if t < min_votes:
-            few_votes += 1
+            excluded["투표 적음"] += 1
             continue
         if r >= ratio:
             passed.append(p)
-    passed.sort(key=lambda p: (-p["ratio"], -p["taste_votes"]))
 
     k = jev_key()
+    use, maxes, want_keywords, opposite_keywords, menu_labels = set(), {"조건": 0, "메뉴": 0}, {}, {}, {}
     jev = {"used": False, "note": "Jev 미연결(키 없음) — 숫자 기준만 적용" if not k else "Jev 판정할 후보 없음"}
-    want_keywords = {}
     if k and passed:
         cands = passed[:JEV_MAX]
         try:
             if want:
                 names = sorted({n for p in cands for n, _ in p["keywords"] if not n.endswith("맛있어요")})
-                want_keywords = map_want_to_keywords(want, names, k)
+                rel, opp = relevance(want, names, k)
+                want_keywords = {n: v for n, v in sorted(rel.items(), key=lambda x: -x[1]) if v >= KW_MIN}
+                opposite_keywords = {n: v for n, v in sorted(opp.items(), key=lambda x: -x[1])
+                                     if v >= OPP_MIN and v > rel[n]}
                 for c in cands:
                     c["condition_score"], c["condition_evidence"] = condition_score(c, want_keywords)
+                    c["opposite_score"], c["opposite_evidence"] = condition_score(c, opposite_keywords)
+                maxes["조건"] = max(c["condition_score"] for c in cands)
+                use.add("조건")
+                if max(rel.values() or [0]) < VAGUE:
+                    fetch_reviews(cands)
+                    fits = review_fit(cands, want, k)
+                    for c in cands:
+                        c["review_fit"] = fits.get(c["id"])
+                    use.add("리뷰 문장")
+                    notes.append(f"'{want}' 에 딱 맞는 네이버 키워드가 없어(최고 {max(rel.values()):.2f}) 리뷰 문장으로 보조 판정")
+            if menu:
+                labels = {l for c in cands for l, _ in c.get("menus", [])[:30]}
+                menu_labels = match_menus(menu, labels, k) if labels else {}
+                keep = []
+                for c in cands:
+                    hits = sorted([(l, n) for l, n in c.get("menus", []) if l in menu_labels], key=lambda x: -x[1])
+                    c["menu_evidence"] = hits
+                    c["menu_share"] = sum(n for _, n in hits) / max(c.get("review_total") or 1, 1)
+                    if sum(n for _, n in hits) >= 3:
+                        keep.append(c)
+                    else:
+                        excluded["메뉴 언급 없음"] += 1
+                cands = keep
+                passed = keep + passed[JEV_MAX:]
+                maxes["메뉴"] = max([c["menu_share"] for c in cands] or [0])
+                use.add("메뉴")
             fetch_reviews(cands)
             spons = judge_sponsored(cands, k)
             for c in cands:
                 c["jev_sponsored"] = spons.get(c["id"])
-            # 협찬 의심(0.7 이상)은 뒤로 → 조건 점수 높은 순 → 맛 배수 순
-            passed.sort(key=lambda p: ((p.get("jev_sponsored") or 0) >= 0.7,
-                                       -(p.get("condition_score") or 0), -p["ratio"]))
-            note = f"Jev 판정 적용({len(cands)}곳)"
-            if want:
-                note += (f" — '{want}' → " + ", ".join(f"{n}({v:.2f})" for n, v in list(want_keywords.items())[:4])
-                         if want_keywords else f" — '{want}' 에 맞는 네이버 키워드를 찾지 못함, 맛 순서 유지")
-            jev = {"used": True, "note": note}
+            jev = {"used": True, "note": f"Jev 판정 적용({len(cands)}곳)"}
         except Exception as e:
             jev = {"used": False, "note": f"Jev 실패({type(e).__name__}) — 숫자 기준만 적용"}
+            use.clear()
 
+    for p in passed:
+        p["score"], p["score_parts"] = composite(p, maxes, use)
+    passed.sort(key=lambda p: -p["score"])
     for p in passed:
         p.pop("reviews", None)  # 출력에는 리뷰 원문을 싣지 않는다
         p["keywords"] = p.get("keywords", [])[:6]
-        p.pop("visitorReviewCount", None)
-    return {"area": area, "food_type": food_type, "want": want,
+        p["menus"] = p.get("menus", [])[:6]
+        p.pop("newBusinessHours", None)
+        p.pop("priceCategory", None)
+    return {"area": area, "food_type": food_type, "want": want, "menu": menu,
+            "filters": {"open_now": open_now, "max_price_manwon": max_price},
             "rule": {"min_votes": min_votes, "ratio": ratio},
-            "query": query, "naver_total": total, "want_keywords": want_keywords,
+            "query": query, "naver_total": total, "cached": cached,
+            "want_keywords": want_keywords, "opposite_keywords": opposite_keywords, "menu_labels": menu_labels,
             "checked": len(places), "passed_count": len(passed), "results": passed[:top],
-            "excluded_few_votes": few_votes, "jev": jev, "errors": errors,
-            "seconds": round(time.time() - t0, 1)}
+            "excluded": {k: v for k, v in excluded.items() if v}, "jev": jev, "notes": notes,
+            "errors": errors, "seconds": round(time.time() - t0, 1)}
 
 
 def format_text(res):
     r = res["rule"]
-    out = [f"{res['query']} — 네이버 {res['naver_total']:,}곳 중 상위 {res['checked']}곳 조회, "
-           f"맛 투표 {r['min_votes']}표 이상 & 2위 키워드의 {r['ratio']:g}배 이상 = {res['passed_count']}곳 "
-           f"({res['seconds']}초)", res["jev"]["note"]]
+    head = (f"{res['query']} — 네이버 {res['naver_total']:,}곳 중 상위 {res['checked']}곳"
+            f"{'(캐시)' if res['cached'] else ''} → 통과 {res['passed_count']}곳 ({res['seconds']}초)")
+    out = [head, f"기준: 맛 투표 {r['min_votes']}표 이상 & 2위 키워드의 {r['ratio']:g}배 이상"
+           + (" · 지금 영업 중" if res["filters"]["open_now"] else "")
+           + (f" · {res['filters']['max_price_manwon']:g}만원 대 이하" if res["filters"]["max_price_manwon"] else ""),
+           res["jev"]["note"]]
+    if res["want_keywords"]:
+        out.append(f"'{res['want']}' → " + ", ".join(f"{n}({v:.2f})" for n, v in list(res["want_keywords"].items())[:4])
+                   + (" / 반대: " + ", ".join(list(res["opposite_keywords"])[:3]) if res["opposite_keywords"] else ""))
+    if res["menu_labels"]:
+        out.append(f"'{res['menu']}' 메뉴 → " + ", ".join(list(res["menu_labels"])[:6]))
+    out += res["notes"]
     for n, p in enumerate(res["results"], 1):
-        line = (f"{n}. {p['name']} ({p['category']}) — {p['taste_key']} {p['taste_votes']} / "
-                f"2위 {p['second_votes']} = {p['ratio']:.1f}배")
+        line = f"{n}. {p['name']} ({p['category']}) · 종합 {p['score']:.0f}점 — {p['taste_key']} {p['ratio']:.1f}배"
         if p.get("rating"):
             line += f" · 별점 {p['rating']}"
+        extra = []
         if p.get("condition_evidence"):
-            line += " · 근거: " + ", ".join(f"{n} {c}표" for n, c in p["condition_evidence"][:3])
-        if (p.get("jev_sponsored") or 0) >= 0.7:
-            line += " · ⚠️협찬 리뷰 의심"
-        out += [line, f"   {p['url']}"]
+            extra.append("근거: " + ", ".join(f"{k} {c}표" for k, c in p["condition_evidence"][:3]))
+        if p.get("review_fit") is not None:
+            extra.append(f"리뷰 문장 판정 {p['review_fit']:.2f}")
+        if p.get("menu_evidence"):
+            extra.append("메뉴: " + ", ".join(f"{k} {c}회" for k, c in p["menu_evidence"][:3]))
+        if p.get("opposite_evidence"):
+            extra.append("감점: " + ", ".join(f"{k} {c}표" for k, c in p["opposite_evidence"][:2]))
+        if (p.get("jev_sponsored") or 0) >= SPONSORED_CUT:
+            extra.append("⚠️협찬 리뷰 의심")
+        info = " · ".join(x for x in (p.get("status"), p.get("price")) if x)
+        out.append(line)
+        if extra:
+            out.append("   " + " · ".join(extra))
+        out.append(f"   {info + ' · ' if info else ''}{p['url']}")
     if res["checked"] == 0:
         out.append(f"'{res['query']}' 검색 결과에서 식당을 찾지 못했다."
                    + (f" ({'; '.join(res['errors'])})" if res["errors"] else ""))
     elif not res["results"]:
-        out.append("통과한 곳이 없다. --ratio 1.5 로 낮춰 보거나 지역을 넓혀 볼 것.")
-    if res["excluded_few_votes"]:
-        out.append(f"(투표 {r['min_votes']}표 미만이라 제외: {res['excluded_few_votes']}곳)")
+        out.append("통과한 곳이 없다. --ratio 1.5 로 낮추거나 조건·필터를 줄여 볼 것.")
+    if res["excluded"]:
+        out.append("(제외: " + ", ".join(f"{k} {v}곳" for k, v in res["excluded"].items()) + ")")
     return "\n".join(out)
 
 
@@ -283,14 +497,17 @@ def main():
     ap.add_argument("area", nargs="+", help="지역(예: 성수동)")
     ap.add_argument("--type", default="", help="음식 종류(예: 한식, 고깃집)")
     ap.add_argument("--want", default="", help="조건(예: 조용히 대화하기 좋은 곳) — Jev 판정에 씀")
+    ap.add_argument("--menu", default="", help="찾는 메뉴(예: 크림파스타) — 리뷰 메뉴 언급으로 거름")
+    ap.add_argument("--open-now", action="store_true", help="지금 영업 중인 곳만")
+    ap.add_argument("--max-price", type=float, default=None, help="가격대 상한(만원). 예: 3 → '3만원 대'까지")
     ap.add_argument("--min-votes", type=int, default=100)
     ap.add_argument("--ratio", type=float, default=2.0)
     ap.add_argument("--top", type=int, default=5)
     ap.add_argument("--max-places", type=int, default=100, help="조회할 식당 수(최대 200)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    res = recommend(" ".join(a.area), a.type, a.want, a.min_votes, a.ratio, a.top,
-                    max(1, min(a.max_places, 200)))
+    res = recommend(" ".join(a.area), a.type, a.want, a.menu, a.open_now, a.max_price,
+                    a.min_votes, a.ratio, a.top, max(1, min(a.max_places, 200)))
     print(json.dumps(res, ensure_ascii=False, indent=1) if a.json else format_text(res))
     return 0 if res["checked"] else 1
 
