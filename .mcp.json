@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "naver-matjip": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/skills/naver-matjip/scripts/mcp_server.py"]
+    }
+  }
+}

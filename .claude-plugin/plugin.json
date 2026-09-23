@@ -1,0 +1,9 @@
+{
+  "name": "naver-matjip",
+  "version": "0.1.0",
+  "description": "네이버 플레이스 키워드 투표 기반 맛집 추리기 + TypeSafe Jev 판정 (skill + MCP)",
+  "author": { "name": "hislegend", "url": "https://github.com/hislegend" },
+  "homepage": "https://github.com/hislegend/naver-matjip",
+  "repository": "https://github.com/hislegend/naver-matjip",
+  "license": "MIT"
+}
