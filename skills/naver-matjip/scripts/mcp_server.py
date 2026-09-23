@@ -26,6 +26,7 @@ TOOL = {
             "min_votes": {"type": "integer", "default": 100},
             "ratio": {"type": "number", "default": 2.0},
             "top": {"type": "integer", "default": 5},
+            "max_places": {"type": "integer", "default": 100, "description": "조회할 식당 수(최대 200)"},
         },
         "required": ["area"],
     },
@@ -57,7 +58,8 @@ def handle(req):
         a = params.get("arguments") or {}
         try:
             res = matjip.recommend(a["area"], a.get("food_type", ""), a.get("want", ""),
-                                   int(a.get("min_votes", 100)), float(a.get("ratio", 2.0)), int(a.get("top", 5)))
+                                   int(a.get("min_votes", 100)), float(a.get("ratio", 2.0)), int(a.get("top", 5)),
+                                   max(1, min(int(a.get("max_places", 100)), 200)))
             reply(mid, {"content": [{"type": "text", "text": matjip.format_text(res)}],
                         "structuredContent": res, "isError": res["checked"] == 0})
         except Exception as e:
