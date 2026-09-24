@@ -29,7 +29,7 @@ JEV_URL = os.environ.get("JEV_API_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_KEY_FILE = os.path.expanduser("~/.config/jev/api_key")
 
 Q_LIST = ("query getRestaurants($input: RestaurantListInput) { restaurants: restaurantList(input: $input) "
-          "{ total items { id name category priceCategory roadAddress newBusinessHours { status description } } } }")
+          "{ total items { id name category priceCategory roadAddress imageUrl newBusinessHours { status description } } } }")
 Q_STATS = ("query stats($id: String, $businessType: String) { visitorReviewStats(input: "
            "{businessId: $id, businessType: $businessType}) { id review { avgRating totalCount } "
            "analysis { votedKeyword { details { displayName count } } menus { label count } } } }")
@@ -86,7 +86,7 @@ def cache_key(*parts):
 
 def load_places(query, limit):
     """목록 + 키워드·메뉴 통계. 24시간 캐시. (total, places, from_cache)"""
-    name = "places-" + cache_key(query, limit)
+    name = "places2-" + cache_key(query, limit)  # places2: imageUrl 추가 후 캐시
     hit = cache_get(name)
     if hit:
         return hit["total"], hit["places"], True
@@ -505,10 +505,17 @@ def main():
     ap.add_argument("--top", type=int, default=5)
     ap.add_argument("--max-places", type=int, default=100, help="조회할 식당 수(최대 200)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--card", metavar="PNG", help="결과를 네이버 플레이스 목록 같은 카드 PNG 로도 저장(playwright 필요)")
     a = ap.parse_args()
     res = recommend(" ".join(a.area), a.type, a.want, a.menu, a.open_now, a.max_price,
                     a.min_votes, a.ratio, a.top, max(1, min(a.max_places, 200)))
     print(json.dumps(res, ensure_ascii=False, indent=1) if a.json else format_text(res))
+    if a.card:
+        try:
+            import card
+            print(f"카드: {card.render_png(res, a.card, SPONSORED_CUT)}", file=sys.stderr)
+        except Exception as e:
+            print(f"카드 생성 실패({type(e).__name__}: {e}) — 텍스트 결과만 쓸 것", file=sys.stderr)
     return 0 if res["checked"] else 1
 
 

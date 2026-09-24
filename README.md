@@ -147,7 +147,10 @@ python3 skills/naver-matjip/scripts/matjip.py 을지로 --type 한식 --want "�
 python3 skills/naver-matjip/scripts/matjip.py 성수동 --menu 크림파스타 --max-price 3
 python3 skills/naver-matjip/scripts/matjip.py 강남역 --type 고깃집 --want "10명 회식" --open-now
 python3 skills/naver-matjip/scripts/matjip.py 강남역 --json
+python3 skills/naver-matjip/scripts/matjip.py 성수동 --card card.png   # 네이버 플레이스 목록 같은 카드 PNG 도 저장
 ```
+
+`--card` 는 결과를 HTML 카드(가게 대표 사진·점수·표수·영업 상태)로 채워 헤드리스 크롬으로 찍습니다. 이 옵션만 `playwright`(`pip install playwright`)가 필요하고, 번들 브라우저가 없으면 설치된 Chrome 을 씁니다. 실패해도 텍스트 결과는 그대로 나옵니다.
 
 ## Jev 연결 (선택)
 
