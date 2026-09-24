@@ -360,6 +360,7 @@ OPEN_STATUSES = ("영업 중", "곧 영업 종료", "24시간 영업")
 #  ① 배수 — 맛 표가 2위 키워드의 N배. 리뷰가 많을수록 다른 칭찬도 쌓여 배수가 낮아지므로
 #     리뷰 1천 미만은 ratio×1.5(기본 3배), 1천 이상은 ratio(기본 2배). 국밥집처럼 "맛 말고 누를 게 없는 집"을 잡는다.
 #  ② 비율 — 방문자리뷰 중 맛 표 비율 SHARE_MIN 이상. 맛·친절·신선 칭찬이 고루 쌓여 배수가 낮은 집을 잡는다.
+MEAL_KEY = "음식이 맛있어요"
 LOW_REVIEWS = 1000
 SHARE_MIN = 0.85
 # 리뷰 수 그룹 — 그룹마다 따로 추천한다.
@@ -462,14 +463,14 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
         p["status"] = ((p.get("newBusinessHours") or {}).get("status")) or None
         p["price"] = p.get("priceCategory")
 
-    excluded = {"옆 동네": off_area, "카페": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
+    excluded = {"옆 동네": off_area, "카페·빵집·디저트": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
                 "메뉴 언급 없음": 0, "조건 근거 없음": 0, "업종이 조건과 안 맞음": 0, "이벤트 리뷰로 부푼 비율": 0}
     passed = []
-    no_cafe = not food_type and not menu   # "맛집"만 물으면 카페는 뺀다
+    # "맛집"만 물으면 밥집만 — 맛 키워드 1등이 '음식이 맛있어요'인 곳. 빵·커피·디저트·음료가 1등이면
+    # 카페·빵집·디저트 가게다(업종 이름보다 정확: '베이커리 카페 겸 브런치' 같은 이름도 가른다).
+    # 음식 종류(빵집·디저트·카페 등)나 메뉴를 주면 거르지 않는다.
+    meals_only = not food_type and not menu
     for p in places:
-        if no_cafe and "카페" in (p.get("category") or ""):
-            excluded["카페"] += 1
-            continue
         if open_now and p["status"] not in OPEN_STATUSES:
             excluded["영업 안 함·정보 없음"] += 1
             continue
@@ -481,6 +482,9 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
         p.update(taste_key=key, taste_votes=t, second_votes=rest, ratio=r,
                  share=t / max(p.get("review_total") or 0, 1), group=review_group(p.get("review_total")))
         if key is None:
+            continue
+        if meals_only and key != MEAL_KEY:
+            excluded["카페·빵집·디저트"] += 1
             continue
         if t < min_votes:
             excluded["투표 적음"] += 1
