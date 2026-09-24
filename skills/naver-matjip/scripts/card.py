@@ -48,6 +48,11 @@ a.card { color:inherit; text-decoration:none; }
 .closed { color:var(--red); font-weight:700; }
 .warn { color:var(--red); font-size:12.5px; font-weight:700; margin-top:3px; }
 .empty { color:var(--sub); padding:24px 4px; text-align:center; }
+.walk { color:var(--green); }
+.fb { display:flex; gap:6px; margin-top:6px; }
+.fb button { font-size:14px; padding:3px 10px; border-radius:8px; border:1px solid var(--line); background:transparent; }
+.fb button.on { border-color:var(--green); background:rgba(3,199,90,.15); }
+details.more summary { color:var(--sub); font-size:13px; padding:4px 6px 10px; cursor:pointer; }
 .grp { font-size:15px; font-weight:800; margin:14px 4px 8px; }
 .grp span { color:var(--sub); font-size:12px; font-weight:500; margin-left:6px; }
 """ % WIDTH
@@ -81,7 +86,9 @@ def _card(n, p, img, link=False):
     reviews = f'방문자리뷰 {p["review_total"]:,}' if p.get("review_total") else ""
     st = p.get("status") or ""
     st_cls = "open" if st in ("영업 중", "곧 영업 종료", "24시간 영업") else "closed"
-    info = " · ".join(x for x in (f'<span class="{st_cls}">{e(st)}</span>' if st else "",
+    walk = f'<b class="walk">🚶 {p["walk_min"]}분</b>' if p.get("walk_min") else ""
+    desc = e(p.get("status_desc") or "")   # 예: "15:00에 브레이크타임", "추석 휴무"
+    info = " · ".join(x for x in (walk, f'<span class="{st_cls}">{e(st)}</span>' if st else "", desc,
                                   e(p.get("price") or ""), e(p.get("roadAddress") or "")) if x)
     ev = []
     if p.get("condition_evidence"):
@@ -95,15 +102,20 @@ def _card(n, p, img, link=False):
     if p.get("details"):
         ev.append(" · ".join(f"{icon} {e(d)} 언급" for d, icon in p["details"]))
     warn = f'<div class="warn">{" · ".join(e(x) for x in flags)}</div>' if flags else ""
-    tag, end = (f'<a class="card" href="{e(p["url"])}" target="_blank" rel="noopener">', "</a>") if link \
+    dist = f' data-dist="{p["distance_m"]}"' if p.get("distance_m") is not None else ""
+    tag, end = (f'<a class="card" href="{e(p["url"])}" target="_blank" rel="noopener"{dist}>', "</a>") if link \
         else ('<div class="card">', "</div>")
+    # 웹: 👍/👎(⑦) — 누르면 기억해 두고 👎는 다음부터 빼고 👍는 정답지에 넣는다
+    fb = (f'<span class="fb" data-id="{e(p["id"])}" data-name="{e(p["name"])}">'
+          f'<button type="button" data-v="1" class="{"on" if p.get("liked") else ""}">👍</button>'
+          f'<button type="button" data-v="-1">👎</button></span>') if link else ""
     return f"""{tag}<div class="ph">{ph}<div class="rank">{n}</div></div><div class="body">
 <div class="t"><span class="name">{e(p["name"])}</span><span class="cat">{e(p.get("category") or "")}</span>
 <span class="score">{p["score"]:.0f}점</span></div>
 <div class="row">{rating}{reviews}</div>
 <div class="taste">😋 {e(p["taste_key"])} <b>{p["taste_votes"]:,}표</b> · {e(taste_reason(p))}</div>
 {"".join(f'<div class="ev">{x}</div>' for x in ev)}{warn}
-<div class="row">{info}</div></div>{end}"""
+<div class="row">{info}</div>{fb}</div>{end}"""
 
 
 def taste_reason(p):
@@ -127,28 +139,35 @@ def summary(res):
     return " · ".join(s for s in sub if s)
 
 
+SHOW = 3   # 그룹마다 먼저 보이는 수(나머지는 웹 "더 보기")
+
+
 def cards_html(res, sponsored_cut=0.7, web=False):
-    """카드 목록 HTML 조각. web=True 면 카드가 링크가 되고 사진은 브라우저가 직접 불러온다."""
+    """카드 목록 HTML 조각. web=True 면 카드가 링크가 되고 사진은 브라우저가 직접 불러오며,
+    그룹마다 SHOW 곳 뒤는 "더 보기"로 접는다. PNG(web=False)는 그룹마다 SHOW 곳만."""
     groups = res.get("groups") or {}
-    if groups:   # 리뷰 수 그룹별로 제목을 달고 그룹 안에서 번호를 다시 매긴다
-        items = [p for ps in groups.values() for p in ps]
-        heads = {id(ps[0]): name for name, ps in groups.items()}
-        nums = [n for ps in groups.values() for n in range(1, len(ps) + 1)]
-    else:
-        items = res.get("results") or []
-        heads, nums = {}, list(range(1, len(items) + 1))
+    if not groups:
+        groups = {"": res.get("results") or []}
+    if not web:
+        groups = {g: ps[:SHOW] for g, ps in groups.items()}
+    items = [p for ps in groups.values() for p in ps]
     for p in items:
         p["sponsored_flag"] = (p.get("jev_sponsored") or 0) >= sponsored_cut
     if web:
-        imgs = [thumb_url(p.get("imageUrl")) for p in items]
+        imgs = {id(p): thumb_url(p.get("imageUrl")) for p in items}
     else:
         with cf.ThreadPoolExecutor(6) as ex:
-            imgs = list(ex.map(lambda p: _image(p.get("imageUrl")), items))
-    def head(p):
-        g = heads.get(id(p))
-        return f'<div class="grp">{html.escape(g)}<span>{GROUP_NOTE.get(g, "")}</span></div>' if g else ""
-    return "".join(head(p) + _card(n, p, i, link=web) for n, p, i in zip(nums, items, imgs)) \
-        or '<div class="empty">기준을 통과한 곳이 없습니다.</div>'
+            imgs = dict(zip(map(id, items), ex.map(lambda p: _image(p.get("imageUrl")), items)))
+    out = []
+    for g, ps in groups.items():
+        if not ps:
+            continue
+        head = f'<div class="grp">{html.escape(g)}<span>{GROUP_NOTE.get(g, "")}</span></div>' if g else ""
+        cards = [_card(n, p, imgs[id(p)], link=web) for n, p in enumerate(ps, 1)]
+        more = (f'<details class="more"><summary>더 보기 ({len(cards) - SHOW}곳)</summary>'
+                + "".join(cards[SHOW:]) + "</details>") if len(cards) > SHOW else ""
+        out.append(f'<div class="gbox">{head}{"".join(cards[:SHOW])}{more}</div>')
+    return "".join(out) or '<div class="empty">기준을 통과한 곳이 없습니다.</div>'
 
 
 def build_html(res, sponsored_cut=0.7):

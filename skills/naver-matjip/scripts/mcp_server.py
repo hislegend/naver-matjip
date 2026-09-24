@@ -31,8 +31,10 @@ TOOL = {
                       "description": "맛 표가 2위 키워드의 몇 배여야 하나(리뷰 1천 미만은 1.5배 더). 방문자 85%+ 맛있어요면 배수와 무관하게 통과"},
             "top": {"type": "integer", "default": 5},
             "max_places": {"type": "integer", "default": 100, "description": "조회할 식당 수(최대 200)"},
+            "near_lat": {"type": "number", "description": "이 좌표 주변 1.5km에서 찾기(위도). area 없이도 됨"},
+            "near_lng": {"type": "number", "description": "경도"},
+            "meal": {"type": "string", "enum": ["아침", "브런치", "점심", "저녁", "야식"], "description": "끼니 — 오늘 쉬는 곳 제외"},
         },
-        "required": ["area"],
     },
 }
 
@@ -62,11 +64,13 @@ def handle(req):
         a = params.get("arguments") or {}
         try:
             res = matjip.recommend(
-                a["area"], a.get("food_type", ""), a.get("want", ""), a.get("menu", ""),
+                a.get("area", ""), a.get("food_type", ""), a.get("want", ""), a.get("menu", ""),
                 bool(a.get("open_now", False)),
                 float(a["max_price"]) if a.get("max_price") is not None else None,
                 int(a.get("min_votes", 100)), float(a.get("ratio", 2.0)), int(a.get("top", 5)),
-                max(1, min(int(a.get("max_places", 100)), 200)))
+                max(1, min(int(a.get("max_places", 100)), 200)),
+                (float(a["near_lat"]), float(a["near_lng"])) if a.get("near_lat") is not None else None,
+                a.get("meal", ""))
             reply(mid, {"content": [{"type": "text", "text": matjip.format_text(res)}],
                         "structuredContent": res, "isError": res["checked"] == 0})
         except Exception as e:
