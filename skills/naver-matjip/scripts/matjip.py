@@ -475,7 +475,8 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
 
     for p in passed:
         p["score"], p["score_parts"] = composite(p, maxes, use)
-    passed.sort(key=lambda p: -p["score"])
+    # 배수가 주 규칙(회장님 2026-09-25): 배수 통과가 먼저, 비율로만 붙은 곳은 그 뒤를 채운다
+    passed.sort(key=lambda p: ("배수" not in p["pass_by"], -p["score"]))
     groups = {name: [p for p in passed if p["group"] == name][:GROUP_TOP] for name, _ in GROUPS}
     for p in passed:
         p.pop("reviews", None)  # 출력에는 리뷰 원문을 싣지 않는다
