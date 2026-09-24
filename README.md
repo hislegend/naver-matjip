@@ -147,7 +147,10 @@ python3 skills/naver-matjip/scripts/matjip.py 을지로 --type 한식 --want "�
 python3 skills/naver-matjip/scripts/matjip.py 성수동 --menu 크림파스타 --max-price 3
 python3 skills/naver-matjip/scripts/matjip.py 강남역 --type 고깃집 --want "10명 회식" --open-now
 python3 skills/naver-matjip/scripts/matjip.py 강남역 --json
+python3 skills/naver-matjip/scripts/matjip.py 성수동 --card card.png   # 네이버 플레이스 목록 같은 카드 PNG 도 저장
 ```
+
+`--card` 는 결과를 HTML 카드(가게 대표 사진·점수·표수·영업 상태)로 채워 헤드리스 크롬으로 찍습니다. 이 옵션만 `playwright`(`pip install playwright`)가 필요하고, 번들 브라우저가 없으면 설치된 Chrome 을 씁니다. 실패해도 텍스트 결과는 그대로 나옵니다.
 
 ## Jev 연결 (선택)
 
@@ -178,3 +181,7 @@ Korean restaurant finder for AI agents (filters: menu mentions, open now, price 
 ## License
 
 MIT
+
+### 웹 페이지 (개인 서버, 선택)
+
+`web/server.py` 는 한 줄 입력(«을지로 노포 한식 3만원 이하»)을 받아 카드 목록을 보여주는 작은 페이지다. 표준 라이브러리만 쓰고, 기본으로 테일스케일 주소에만 열리며 테일스케일·로컬 요청만 받는다. 사파리 «홈 화면에 추가 / Dock에 추가»로 앱처럼 쓸 수 있다(manifest·아이콘 포함). 상시 실행용 LaunchAgent 예시는 `web/com.crabs.matjip-web.plist.example`.
