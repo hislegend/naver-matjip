@@ -74,7 +74,12 @@ Jev 판정 적용(35곳)
 
 1. **목록** — 네이버 플레이스(지도)에서 "`지역` `음식종류 또는 메뉴` 맛집"으로 상위 100곳(`--max-places`, 최대 200)을 가져옵니다. 50곳씩 묶어 2회.
 2. **거르기** (코드) — 25곳씩 묶어 방문자 키워드·메뉴 언급을 가져오고(4회), 다음을 통과한 곳만 남깁니다.
-   - 맛: `…맛있어요` 표 **100표 이상 & 2등 키워드의 2배 이상** (`--min-votes`, `--ratio`). 카페·빵집은 `커피가/빵이/디저트가 맛있어요`.
+   - 맛: `…맛있어요` 표 **100표 이상** & 아래 둘 중 하나 (`--min-votes`, `--ratio`). 카페·빵집은 `커피가/빵이/디저트가 맛있어요`.
+     - **배수**: 2등 키워드의 2배 이상(리뷰 1천 미만은 3배). 국밥집처럼 "맛 말고 누를 게 없는 집"을 잡습니다.
+     - **비율**: 방문자리뷰의 85% 이상이 맛있어요. 맛·친절·신선 칭찬이 고루 쌓여 배수가 낮아지는 집을 잡습니다.
+     - 배수만 쓰면 리뷰가 많은 집일수록 다른 칭찬이 쌓여 불리했습니다(문정 실측: 맛 96%·별 4.9 집들이 배수 1.2~1.8로 탈락).
+   - 음식 종류·메뉴 없이 "맛집"만 물으면 카페는 뺍니다.
+   - 결과는 리뷰 수로 **대형(1만+)·검증된(1천~1만)·숨은(1천 미만)** 그룹마다 상위 3곳씩(JSON `groups`). 카드에는 통과 사유("2위의 3.8배" / "방문자 96%")가 붙습니다.
    - `--open-now`: 네이버 표시가 `영업 중`·`곧 영업 종료`·`24시간 영업`인 곳만.
    - `--max-price 3`: 네이버 지도의 가격대 표시가 `3만원 대` 이하인 곳만(표시 없는 곳은 남김).
 3. **조건 번역** (`--want`, Jev) — 네이버 키워드 전체에 대해 "이 키워드가 조건의 근거인가 / 반대 근거인가"를 **한 요청**에 묻습니다(투기적 팬아웃). 근거 키워드 표 비중은 가산, 반대 키워드 표 비중은 감점.
@@ -176,7 +181,7 @@ mkdir -p ~/.config/jev && echo '...' > ~/.config/jev/api_key && chmod 600 ~/.con
 
 ## English
 
-Korean restaurant finder for AI agents (filters: menu mentions, open now, price range; composite score with opposite-keyword penalty; 30-case Korean eval: 95% recall, 97% top-1). It pulls the top 100 places for an area from Naver Place and keeps those whose "the food is delicious" visitor votes are at least 2× the runner-up keyword (min. 100 votes). With a TypeSafe Jev API key, Jev translates your request ("quiet place to talk", "dinner for 10") into Naver's visitor-keyword vocabulary in ~0.4 s, and the code ranks candidates by the share of votes on those keywords — so every result comes with vote-count evidence. Jev also flags sponsored-review-heavy places. Works as a Claude Code plugin, a Codex/any-MCP stdio server, or a plain CLI. Stdlib Python only. Unofficial; not affiliated with Naver — keep usage light and personal.
+Korean restaurant finder for AI agents (filters: menu mentions, open now, price range; composite score with opposite-keyword penalty; 30-case Korean eval: 95% recall, 97% top-1). It pulls the top 100 places for an area from Naver Place and keeps those whose "the food is delicious" votes are at least 2× the runner-up keyword (3× under 1,000 reviews) or come from 85%+ of visitor reviews (min. 100 votes), grouped by review count (big / proven / hidden). With a TypeSafe Jev API key, Jev translates your request ("quiet place to talk", "dinner for 10") into Naver's visitor-keyword vocabulary in ~0.4 s, and the code ranks candidates by the share of votes on those keywords — so every result comes with vote-count evidence. Jev also flags sponsored-review-heavy places. Works as a Claude Code plugin, a Codex/any-MCP stdio server, or a plain CLI. Stdlib Python only. Unofficial; not affiliated with Naver — keep usage light and personal.
 
 ## License
 
