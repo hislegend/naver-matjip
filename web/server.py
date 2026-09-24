@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "skills", "naver-matjip", "scripts")
 import card    # noqa: E402
 import matjip  # noqa: E402
 
-HOST = os.environ.get("MATJIP_WEB_HOST", "127.0.0.1")
+# 쉼표로 여러 주소(예: "100.76.x.x,127.0.0.1" — 테일스케일 serve https 는 127.0.0.1 로 들어온다)
+HOSTS = [h.strip() for h in os.environ.get("MATJIP_WEB_HOST", "127.0.0.1").split(",") if h.strip()]
 PORT = int(os.environ.get("MATJIP_WEB_PORT", "8787"))
 ALLOWED = [ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("127.0.0.0/8")]
 RUN_LOCK = threading.Lock()
@@ -34,12 +35,12 @@ OPEN_WORDS = ("지금", "영업중", "지금영업", "열린", "문연")
 DROP = {"맛집", "추천", "추천해줘", "찾아줘", "알려줘", "곳", "좀", "근처", "쪽", "에서", "영업", "중", "중인"}
 
 
-def parse_query(q):
+def parse_query(q, has_area=True):
     """한 줄 요청 → 옵션 dict (규칙 기반, 즉시).
     첫 낱말 = 지역, «N만원» = 가격 상한, 음식 낱말 = 종류(길게 붙은 건 메뉴), «지금·영업중» = 영업 중만, 나머지 = 조건.
     조건은 matjip 이 Jev 로 네이버 키워드에 맞춰 번역한다."""
     q = q.strip()
-    opt = {"area": "", "type": "", "menu": "", "want": "", "max_price": None, "open_now": False, "by": "rule"}
+    opt = {"area": "", "type": "", "menu": "", "want": "", "max_price": None, "open_now": False, "meal": "", "by": "rule"}
     m = PRICE.search(q)
     if m:
         opt["max_price"] = float(m.group(1))
@@ -47,11 +48,17 @@ def parse_query(q):
     words = q.split()
     if not words:
         return opt
-    opt["area"] = AREA_SUFFIX.sub("", words[0]) or words[0]
+    if has_area:   # "내 근처"면 지역 없이 전부 조건·음식으로 본다
+        opt["area"] = AREA_SUFFIX.sub("", words[0]) or words[0]
+        words = words[1:]
     rest = []
-    for w in words[1:]:
+    for w in words:
         if any(w.startswith(o) for o in OPEN_WORDS):
             opt["open_now"] = True
+            continue
+        meal = next((m for m in matjip.MEAL_WORDS if w.startswith(m)), None)
+        if meal:   # 점심·저녁 → 끼니(오늘 쉬는 곳 제외). 조건으로 넘기지 않는다
+            opt["meal"] = meal
             continue
         core = w if w in FOOD_TYPES else (re.sub(r"(맛집|집|으로|로|이랑|랑)$", "", w) or w)
         if not opt["type"] and core in FOOD_TYPES:
@@ -96,23 +103,64 @@ def jev_refine(opt, words):
     opt["want"], opt["dropped"], opt["by"] = " ".join(keep), dropped, "jev"
 
 
-def search(q, open_now):
+def search(q, open_now, near=None):
     t0 = time.time()
-    opt = parse_query(q)
+    opt = parse_query(q, has_area=not near)
     open_now = open_now or opt["open_now"]
-    if not opt["area"]:
-        return {"error": "지역을 못 알아들었어요. 예: 을지로 조용한 한식"}
+    if not opt["area"] and not near:
+        return {"error": "지역을 못 알아들었어요. 예: 을지로 조용한 한식 (또는 📍내 근처)"}
+    args = (opt["area"], opt["type"], opt["want"], opt["menu"], open_now, opt["max_price"])
+    kw = {"near": near, "meal": opt["meal"]}
     with RUN_LOCK:
-        res = matjip.recommend(opt["area"], opt["type"], opt["want"], opt["menu"], open_now, opt["max_price"])
+        res = matjip.recommend(*args, **kw)
     if not res["results"] and res["checked"]:
         # 규칙(70-matjip): 통과 0곳이면 기준을 1.5배로 낮춰 한 번 더 — 캐시라 네이버 재조회 없음
         with RUN_LOCK:
-            res = matjip.recommend(opt["area"], opt["type"], opt["want"], opt["menu"], open_now,
-                                   opt["max_price"], ratio=1.5)
+            res = matjip.recommend(*args, ratio=1.5, **kw)
         res["notes"].append("2배 기준 통과가 없어 1.5배로 낮춰 다시 봤습니다")
     return {"parsed": opt, "summary": card.summary(res), "notes": res["notes"] + res["errors"],
             "html": card.cards_html(res, matjip.SPONSORED_CUT, web=True),
             "seconds": round(time.time() - t0, 1)}
+
+
+GOLD_FILE = os.path.expanduser(os.environ.get("NAVER_MATJIP_GOLD", "~/.config/naver-matjip/gold.json"))
+FB_LOCK = threading.Lock()
+
+
+def _save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def feedback(body):
+    """👍/👎 저장(⑦). 👍 는 정답지(①)에도 넣고, 같은 버튼을 다시 누르면 취소."""
+    pid, name = str(body.get("id") or "")[:20], str(body.get("name") or "")[:80]
+    area, vote = str(body.get("area") or "")[:40], int(body.get("vote") or 0)
+    if not pid.isdigit() or vote not in (1, -1):
+        return {"error": "잘못된 요청"}
+    with FB_LOCK:
+        fb = matjip.load_feedback()
+        cur = fb.get(pid, {}).get("vote")
+        if cur == vote:
+            fb.pop(pid, None)
+            vote = 0
+        else:
+            fb[pid] = {"name": name, "area": area, "vote": vote, "ts": time.strftime("%F %T")}
+        _save_json(matjip.FEEDBACK_FILE, fb)
+        try:
+            gold = json.load(open(GOLD_FILE))
+        except Exception:
+            gold = {}
+        if area:
+            names = [n for n in gold.get(area, []) if n != name]
+            if vote > 0:
+                names.append(name)
+            gold[area] = names
+            _save_json(GOLD_FILE, {a: n for a, n in gold.items() if n})
+    return {"vote": vote}
 
 
 MANIFEST = {"name": "맛집", "short_name": "맛집", "start_url": "/", "display": "standalone",
@@ -141,19 +189,60 @@ label.chk { color:var(--sub); font-size:14px; display:flex; align-items:center; 
 .parsed b { color:var(--text); }
 .status { color:var(--sub); padding:28px 4px; text-align:center; }
 .err { color:var(--red); padding:16px 4px; }
+.opts { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:12px; }
+.opts label.chk { margin:0; }
+button.ghost { font-size:14px; font-weight:700; padding:8px 12px; background:transparent; color:var(--green);
+  border:1px solid var(--green); border-radius:10px; }
+.sort { font-size:13px; color:var(--sub); margin:0 4px 6px; }
+.sort a { color:var(--green); cursor:pointer; }
 </style></head><body>
 <div class="head"><h1><b>N</b> 맛집</h1><p>네이버 «맛있어요» 투표 + Jev 판정</p></div>
 <form id="f"><input id="q" type="text" placeholder="을지로 조용히 대화하기 좋은 한식" autocomplete="off" enterkeyhint="search">
 <button id="b">찾기</button></form>
-<label class="chk"><input id="open" type="checkbox"> 지금 영업 중인 곳만</label>
+<div class="opts"><label class="chk"><input id="open" type="checkbox"> 지금 영업 중인 곳만</label>
+<button type="button" id="near" class="ghost">📍 내 근처</button></div>
 <div id="out"></div>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 try { $('q').value = localStorage.getItem('q') || ''; $('open').checked = localStorage.getItem('open') === '1'; } catch (e) {}
-$('f').onsubmit = async ev => {
-  ev.preventDefault();
-  const q = $('q').value.trim(); if (!q) return;
+let lastArea = '';
+function sortByDistance() {   // 그룹 안에서 가까운 순(더 보기에 접힌 것까지)
+  document.querySelectorAll('.gbox').forEach(g => {
+    const cards = [...g.querySelectorAll('a.card')];
+    cards.sort((a, b) => (+a.dataset.dist || 1e9) - (+b.dataset.dist || 1e9));
+    const more = g.querySelector('details.more');
+    cards.forEach((c, i) => { c.querySelector('.rank').textContent = i + 1;
+      (i < 3 || !more) ? g.insertBefore(c, more) : more.appendChild(c); });
+  });
+}
+document.addEventListener('click', async ev => {
+  const b = ev.target.closest('.fb button'); if (b) {
+    ev.preventDefault(); ev.stopPropagation();
+    const f = b.parentElement;
+    try {
+      const r = await fetch('/api/fb', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: f.dataset.id, name: f.dataset.name, area: lastArea, vote: +b.dataset.v})});
+      const d = await r.json();
+      f.querySelectorAll('button').forEach(x => x.classList.toggle('on', +x.dataset.v === d.vote));
+      if (d.vote === -1) f.closest('a.card').style.opacity = .35;
+      else f.closest('a.card').style.opacity = 1;
+    } catch (e) {}
+    return;
+  }
+  if (ev.target.id === 'sortd') { ev.preventDefault(); sortByDistance(); ev.target.textContent = '가까운 순 ✓'; }
+}, true);
+$('near').onclick = () => {
+  if (!navigator.geolocation) { $('out').innerHTML = '<div class="err">이 브라우저는 위치를 못 알려줘요.</div>'; return; }
+  $('out').innerHTML = '<div class="status">위치 확인 중…</div>';
+  navigator.geolocation.getCurrentPosition(
+    p => run({lat: p.coords.latitude, lng: p.coords.longitude}),
+    e => { $('out').innerHTML = '<div class="err">위치를 못 가져왔어요 — 설정에서 위치 권한을 허용해 주세요. (' + esc(e.message) + ')</div>'; },
+    {enableHighAccuracy: true, timeout: 10000, maximumAge: 60000});
+};
+$('f').onsubmit = ev => { ev.preventDefault(); run(null); };
+async function run(pos) {
+  const q = $('q').value.trim(); if (!q && !pos) return;
   try { localStorage.setItem('q', q); localStorage.setItem('open', $('open').checked ? '1' : '0'); } catch (e) {}
   $('q').blur(); $('b').disabled = true;
   const t0 = Date.now();
@@ -161,19 +250,21 @@ $('f').onsubmit = async ev => {
   const tick = setInterval(() => { const s = $('st'); if (s) s.textContent = '찾는 중… ' + Math.round((Date.now() - t0) / 1000) + '초'; }, 1000);
   try {
     const r = await fetch('/api/search', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({q, open_now: $('open').checked})});
+      body: JSON.stringify(Object.assign({q, open_now: $('open').checked}, pos || {}))});
     const d = await r.json();
     if (d.error) { $('out').innerHTML = '<div class="err">' + esc(d.error) + '</div>'; return; }
     const p = d.parsed;
-    const bits = [p.area, p.type, p.menu, p.want, p.max_price ? p.max_price + '만원 이하' : ''].filter(Boolean);
+    lastArea = p.area || '내 근처';
+    const bits = [p.area || (pos ? '📍내 근처' : ''), p.type, p.menu, p.want, p.meal, p.max_price ? p.max_price + '만원 이하' : ''].filter(Boolean);
     $('out').innerHTML = '<div class="parsed">이렇게 이해했어요: <b>' + bits.map(esc).join(' / ') + '</b>'
       + (p.open_now ? ' / 지금 영업 중' : '')
       + (p.dropped && p.dropped.length ? ' (뺀 말: ' + p.dropped.map(esc).join(', ') + ')' : '') + '<br>' + esc(d.summary)
-      + d.notes.map(n => '<br>' + esc(n)).join('') + ' · ' + d.seconds + '초</div>' + d.html;
+      + d.notes.map(n => '<br>' + esc(n)).join('') + ' · ' + d.seconds + '초</div>'
+      + (d.html.includes('data-dist') ? '<div class="sort"><a id="sortd">가까운 순으로 보기</a></div>' : '') + d.html;
   } catch (e) {
     $('out').innerHTML = '<div class="err">연결 실패 — 테일스케일이 켜져 있는지 확인해 주세요.</div>';
   } finally { clearInterval(tick); $('b').disabled = false; }
-};
+}
 </script></body></html>""".replace("__CSS__", card.CSS)
 
 
@@ -211,12 +302,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._allowed():
             return self._send(403, "forbidden", "text/plain")
-        if self.path != "/api/search":
+        if self.path not in ("/api/search", "/api/fb"):
             return self._send(404, "not found", "text/plain")
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            if self.path == "/api/fb":
+                return self._send(200, json.dumps(feedback(body), ensure_ascii=False), "application/json; charset=utf-8")
             q = str(body.get("q") or "").strip()[:200]
-            out = search(q, bool(body.get("open_now"))) if q else {"error": "검색어를 넣어 주세요"}
+            near = None
+            if body.get("lat") is not None and body.get("lng") is not None:
+                near = (float(body["lat"]), float(body["lng"]))
+            out = search(q or ("맛집" if near else ""), bool(body.get("open_now")), near) \
+                if (q or near) else {"error": "검색어를 넣어 주세요"}
         except Exception as e:
             out = {"error": f"오류: {type(e).__name__}"}
             print(f"[{time.strftime('%F %T')}] 오류 {e!r}", flush=True)
@@ -227,5 +324,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"matjip web: http://{HOST}:{PORT}", flush=True)
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    servers = [ThreadingHTTPServer((h, PORT), Handler) for h in HOSTS]
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print("matjip web: " + ", ".join(f"http://{h}:{PORT}" for h in HOSTS), flush=True)
+    servers[0].serve_forever()

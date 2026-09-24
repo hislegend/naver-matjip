@@ -29,12 +29,12 @@ JEV_URL = os.environ.get("JEV_API_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_KEY_FILE = os.path.expanduser("~/.config/jev/api_key")
 
 Q_LIST = ("query getRestaurants($input: RestaurantListInput) { restaurants: restaurantList(input: $input) "
-          "{ total items { id name category priceCategory roadAddress address imageUrl newBusinessHours { status description } } } }")
+          "{ total items { id name category priceCategory roadAddress address x y imageUrl newBusinessHours { status description } } } }")
 Q_STATS = ("query stats($id: String, $businessType: String) { visitorReviewStats(input: "
            "{businessId: $id, businessType: $businessType}) { id review { avgRating totalCount } "
            "analysis { votedKeyword { details { displayName count } } menus { label count } } } }")
 Q_REVIEWS = ("query reviews($input: VisitorReviewsInput) { visitorReviews(input: $input) "
-             "{ items { body } } }")
+             "{ items { body created } } }")
 
 
 def gql(ops, timeout=20):
@@ -84,23 +84,26 @@ def cache_key(*parts):
     return hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:16]
 
 
-def load_places(query, limit):
-    """목록 + 키워드·메뉴 통계. 24시간 캐시. (total, places, from_cache)"""
-    name = "places3-" + cache_key(query, limit)  # places3: 지번 주소(동) 추가 후 캐시
+def load_places(query, limit, near=None):
+    """목록 + 키워드·메뉴 통계. 24시간 캐시. (total, places, from_cache)
+    near=(lat, lng) 면 그 좌표 주변을 찾는다(캐시 키는 약 100m 단위로 반올림)."""
+    xy = f"{near[1]:.3f},{near[0]:.3f}" if near else ""
+    name = "places4-" + cache_key(query + xy, limit)  # places4: 좌표 추가 후 캐시
     hit = cache_get(name)
     if hit:
         return hit["total"], hit["places"], True
-    total, places = list_places(query, limit)
+    total, places = list_places(query, limit, near)
     if places:
         fetch_stats(places)
         cache_put(name, {"total": total, "places": places})
     return total, places, False
 
 
-def list_places(query, limit):
-    """검색어로 식당 목록을 가져온다. limit 개까지(50개 단위)."""
-    ops = [{"operationName": "getRestaurants", "query": Q_LIST, "variables": {"input": {
-        "query": query, "start": start, "display": PAGE_SIZE, "isNmap": True}}}
+def list_places(query, limit, near=None):
+    """검색어로 식당 목록을 가져온다. limit 개까지(50개 단위). near=(lat, lng) 면 그 주변."""
+    geo = {"x": f"{near[1]:.6f}", "y": f"{near[0]:.6f}"} if near else {}
+    ops = [{"operationName": "getRestaurants", "query": Q_LIST, "variables": {"input": dict({
+        "query": query, "start": start, "display": PAGE_SIZE, "isNmap": True}, **geo)}}
         for start in range(1, limit + 1, PAGE_SIZE)]
     total, items = 0, []
     for r in gql(ops):
@@ -138,9 +141,9 @@ def fetch_reviews(places, size=30):
     """최근 방문자 리뷰 본문을 한 요청으로 가져와 places 에 채운다(Jev 판정용). 식당별 24시간 캐시."""
     todo = []
     for p in places:
-        hit = cache_get("reviews-" + p["id"])
+        hit = cache_get("reviews2-" + p["id"])   # reviews2: 작성일 추가
         if hit is not None:
-            p["reviews"] = hit
+            p["reviews"], p["review_dates"] = hit["bodies"], hit["dates"]
         else:
             todo.append(p)
     places = todo
@@ -154,7 +157,42 @@ def fetch_reviews(places, size=30):
         bodies = [i["body"].strip() for i in items if i.get("body")]
         # "맛있어요" 한 줄짜리는 조건 판단 근거가 안 된다 — 긴 리뷰부터 쓴다
         p["reviews"] = sorted([b for b in bodies if len(b) >= 20], key=len, reverse=True)
-        cache_put("reviews-" + p["id"], p["reviews"])
+        p["review_dates"] = [i.get("created") or "" for i in items]   # 최신순
+        cache_put("reviews2-" + p["id"], {"bodies": p["reviews"], "dates": p["review_dates"]})
+
+
+def parse_review_date(s, today=None):
+    """네이버 작성일 '9.19.토'(올해) / '25.12.3.수'(연도 두 자리) → date. 못 읽으면 None."""
+    import datetime as dt
+    today = today or dt.date.today()
+    nums = [int(x) for x in re.findall(r"\d+", s or "")]
+    try:
+        if len(nums) >= 3:
+            return dt.date(2000 + nums[0], nums[1], nums[2])
+        if len(nums) == 2:
+            d = dt.date(today.year, nums[0], nums[1])
+            return d if d <= today else dt.date(today.year - 1, nums[0], nums[1])
+    except ValueError:
+        return None
+    return None
+
+
+SURGE_MIN_REVIEWS = 20   # 날짜 읽힌 최근 리뷰가 이만큼은 있어야 판정
+SURGE_FACTOR = 3.0       # 지금 속도로 1년이면 지금까지 전체 리뷰의 3배 이상 → 급증
+# 표시만 한다(비율 통과는 그대로). 최근 30개만 보므로 새로 연 가게·연휴 몰림도 걸린다 —
+# 문정 실측(09-25): 1.5배 기준이면 46곳 중 9곳이 걸려 탄심(연휴 4일에 30개) 같은 곳까지 빠졌다.
+
+
+def review_surge(p):
+    """최근 리뷰 속도로 급증 여부(②). 새로 연 가게이거나 리뷰 이벤트일 때 많이 걸린다.
+    (급증?, 하루 리뷰 수)"""
+    import datetime as dt
+    ds = [d for d in (parse_review_date(x) for x in p.get("review_dates") or []) if d]
+    if len(ds) < SURGE_MIN_REVIEWS:
+        return False, None
+    span = max((dt.date.today() - min(ds)).days, 1)
+    pace = len(ds) / span
+    return pace * 365 >= SURGE_FACTOR * max(p.get("review_total") or 0, 1), round(pace, 2)
 
 
 def taste_ratio(place):
@@ -316,6 +354,35 @@ def pick_details(want, key):
     return [d for v, d in ranked if v >= 0.6][:DETAIL_MAX]
 
 
+CHAIN_CUT = 0.7
+# Jev 는 전국 대형 브랜드(파리바게뜨 0.93·맥도날드 0.97)만 알아보고 중견 프랜차이즈(쿠우쿠우 0.25·애슐리 0.28)는
+# 못 가른다(2026-09-25 실측). 자주 보이는 외식 프랜차이즈 이름으로 보탠다 — 이름이 이것으로 시작하면 체인.
+CHAIN_BRANDS = """애슐리 쿠우쿠우 본죽 본도시락 명륜진사갈비 백소정 육회바른연어 역전할머니맥주 투다리 교촌 BBQ bhc 굽네
+네네치킨 처갓집 페리카나 푸라닭 60계 맘스터치 롯데리아 버거킹 KFC 서브웨이 파파존스 도미노 피자헛 미스터피자
+김밥천국 김가네 고봉민김밥 바르다김선생 신전떡볶이 엽기떡볶이 동대문엽기떡볶이 배떡 청년다방 죠스떡볶이 국대떡볶이
+홍콩반점 역전우동 새마을식당 한신포차 백종원의 원조쌈밥집 빽다방 한솥 오봉집 원할머니보쌈 놀부 채선당 샤브올데이
+등촌샤브 봉추찜닭 두끼 신선설농탕 이삭토스트 뚜레쥬르 파리바게뜨 던킨 크리스피크림 배스킨라빈스 설빙 스타벅스
+이디야 투썸플레이스 메가MGC커피 컴포즈커피 할리스 폴바셋 아웃백 빕스 VIPS 계절밥상 자연별곡 아비꼬 코코이찌방야
+미소야 스시로 쿠우쿠우 하남돼지집 생활맥주 청년치킨 불막열삼 고기싸롱 봉구스밥버거 경복궁""".split()
+
+
+def is_chain_brand(name):
+    n = (name or "").replace(" ", "").lower()
+    return any(n.startswith(b.lower()) for b in CHAIN_BRANDS)
+
+
+def chain_scores(names, key):
+    """가게 이름만 보고 전국 체인·프랜차이즈 지점인지(③). {이름: 확률}"""
+    q = {f"n{i}": {
+        "type": "noul",
+        "instructions": f"'{n}' 는 전국에 지점이 많은 체인·프랜차이즈 브랜드의 한 지점인가?",
+        "criteria": {"true": f"'{n}' 는 잘 알려진 체인·프랜차이즈 지점이다(예: 파리바게뜨 OO점, 맥도날드 OO점)",
+                     "false": f"'{n}' 는 개인 가게이거나 지점이 몇 개뿐인 작은 가게다"},
+    } for i, n in enumerate(names)}
+    ans = jev_call({}, q, key)
+    return {n: ans[f"n{i}"]["noul"] for i, n in enumerate(names)}
+
+
 def judge_reviews(cands, key, details=()):
     """식당마다 최근 리뷰로 한 번에 판정한다(식당당 1요청, 병렬). {id: {질문: 확률}}
     협찬 · 리뷰 이벤트(②보강) · 맛 변함(②) · 웨이팅(③) · 조건 세부(⑤)."""
@@ -365,7 +432,42 @@ LOW_REVIEWS = 1000
 SHARE_MIN = 0.85
 # 리뷰 수 그룹 — 그룹마다 따로 추천한다.
 GROUPS = (("대형 맛집", 10000), ("검증된 맛집", LOW_REVIEWS), ("숨은 맛집", 0))
-GROUP_TOP = 3
+GROUP_TOP = 3          # 카드·텍스트에 먼저 보이는 수
+GROUP_MORE = 10        # 웹 "더 보기"까지 합친 그룹별 최대
+NEAR_MAX_M = 1500      # 내 근처: 이 거리(직선)까지만
+MEAL_WORDS = ("아침", "브런치", "점심", "저녁", "야식")
+FEEDBACK_FILE = os.path.expanduser(os.environ.get("NAVER_MATJIP_FEEDBACK", "~/.config/naver-matjip/feedback.json"))
+
+
+MEAL_HOURS = {"아침": (7, 10), "브런치": (10, 14), "점심": (11, 14), "저녁": (17, 21), "야식": (21, 25)}
+
+
+def meal_ok(meal, desc):
+    """네이버 목록의 영업 안내 한 줄('16:00에 영업 시작' / '21:00에 영업 종료')로 그 끼니에 여는지 대략 본다.
+    목록에는 요일별 영업시간이 없어서 이 한 줄로만 판단한다 — 모르면 통과(⑥)."""
+    m = re.search(r"(\d{1,2}):(\d{2})에 (영업 시작|영업 종료|라스트오더)", desc or "")
+    if not m or meal not in MEAL_HOURS:
+        return True
+    h = int(m.group(1)) + int(m.group(2)) / 60
+    lo, hi = MEAL_HOURS[meal]
+    if m.group(3) == "영업 시작":
+        return h < hi - 1          # 끼니가 끝나기 1시간 전까지는 열어야
+    return h > lo + 1 or h < 5     # 끼니 시작 1시간 뒤까지는 열려 있어야(새벽 마감 허용)
+
+
+def load_feedback():
+    """{가게 id: {name, area, vote(+1/-1), ts}} — 웹 👍/👎(⑦). 없으면 {}."""
+    try:
+        return json.load(open(FEEDBACK_FILE))
+    except Exception:
+        return {}
+
+
+def distance_m(lat1, lng1, lat2, lng2):
+    r = 6371000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 # 조건을 줬는데 그 조건 키워드 표가 이만큼도 없으면 뺀다(2026-09-25: "아이랑"에 근거 0표인 요리주점이 올라옴)
 COND_MIN_VOTES = 10
 
@@ -446,24 +548,46 @@ def composite(c, maxes, use):
 
 
 def recommend(area, food_type="", want="", menu="", open_now=False, max_price=None,
-              min_votes=100, ratio=2.0, top=5, max_places=100):
-    """조회 → 거르기(영업·가격·맛) → Jev(조건·반대·메뉴·협찬) → 종합 점수. CLI·MCP 공용."""
+              min_votes=100, ratio=2.0, top=5, max_places=100, near=None, meal=""):
+    """조회 → 거르기(영업·가격·맛) → Jev(조건·반대·메뉴·협찬) → 종합 점수. CLI·MCP 공용.
+    near=(위도, 경도) 면 그 주변(지역 없이도 됨), meal=점심 등이면 오늘 쉬는 곳을 뺀다."""
     t0 = time.time()
     query = " ".join(x for x in (area, food_type or menu, "맛집") if x)
     errors, notes = [], []
     try:
-        total, places, cached = load_places(query, max_places)
+        total, places, cached = load_places(query, max_places, near)
     except Exception as e:
         total, places, cached = 0, [], False
         errors.append(f"조회 실패: {type(e).__name__} {e}")
     listed = len(places)
-    places, off_area = area_filter(places, area)
+    places, off_area = area_filter(places, area) if area else (places, 0)
+    fb = load_feedback()
+    disliked = {i for i, v in fb.items() if v.get("vote", 0) < 0}
+    far = 0
+    if near:
+        kept = []
+        for p in places:
+            try:
+                p["distance_m"] = round(distance_m(near[0], near[1], float(p["y"]), float(p["x"])))
+            except (KeyError, TypeError, ValueError):
+                p["distance_m"] = None
+            if p["distance_m"] is not None and p["distance_m"] > NEAR_MAX_M:
+                far += 1
+                continue
+            # 걷는 시간: 직선거리 ×1.3(길 돌아가기) ÷ 분당 70m
+            p["walk_min"] = max(1, round(p["distance_m"] * 1.3 / 70)) if p["distance_m"] is not None else None
+            kept.append(p)
+        places = kept
     for p in places:
         p["url"] = f"https://m.place.naver.com/restaurant/{p['id']}/home"
         p["status"] = ((p.get("newBusinessHours") or {}).get("status")) or None
+        p["status_desc"] = ((p.get("newBusinessHours") or {}).get("description")) or None
         p["price"] = p.get("priceCategory")
+        p["liked"] = fb.get(p["id"], {}).get("vote", 0) > 0
 
-    excluded = {"옆 동네": off_area, "카페·빵집·디저트": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
+    excluded = {"옆 동네": off_area, f"{NEAR_MAX_M / 1000:g}km 밖": far, "👎 표시한 곳": 0, "오늘 쉬는 곳": 0,
+                "그 끼니에 문 닫음": 0,
+                "카페·빵집·디저트": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
                 "메뉴 언급 없음": 0, "조건 근거 없음": 0, "업종이 조건과 안 맞음": 0, "이벤트 리뷰로 부푼 비율": 0}
     passed = []
     # "맛집"만 물으면 밥집만 — 맛 키워드 1등이 '음식이 맛있어요'인 곳. 빵·커피·디저트·음료가 1등이면
@@ -471,6 +595,15 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
     # 음식 종류(빵집·디저트·카페 등)나 메뉴를 주면 거르지 않는다.
     meals_only = not food_type and not menu
     for p in places:
+        if p["id"] in disliked:
+            excluded["👎 표시한 곳"] += 1
+            continue
+        if meal and p["status"] == "오늘 휴무":
+            excluded["오늘 쉬는 곳"] += 1
+            continue
+        if meal and not meal_ok(meal, p["status_desc"]):
+            excluded["그 끼니에 문 닫음"] += 1
+            continue
         if open_now and p["status"] not in OPEN_STATUSES:
             excluded["영업 안 함·정보 없음"] += 1
             continue
@@ -563,6 +696,7 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
                 c["jev_sponsored"] = j.get("sponsored")
                 c["jev_event"], c["jev_declined"], c["jev_waiting"] = j.get("event"), j.get("declined"), j.get("waiting")
                 c["details"] = [(d, DETAILS[d]) for d in j.get("details", [])]
+                c["surge"], c["review_pace"] = review_surge(c)
                 # 리뷰 이벤트가 많으면 방문자 비율이 부풀므로 비율 통과를 인정하지 않는다(배수 통과만)
                 if (c["jev_event"] or 0) >= REVIEW_FLAG and "비율" in c["pass_by"]:
                     c["pass_by"] = [x for x in c["pass_by"] if x != "비율"]
@@ -573,6 +707,9 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
             gone = {c["id"] for c in cands} - {c["id"] for c in keep}
             passed = [p for p in passed if p["id"] not in gone]
             cands = keep
+            chains = chain_scores([c["name"] for c in cands], k) if cands else {}
+            for c in cands:
+                c["chain"] = chains.get(c["name"], 0) >= CHAIN_CUT or is_chain_brand(c["name"])
             jev = {"used": True, "note": f"Jev 판정 적용({len(cands)}곳)"}
         except Exception as e:
             jev = {"used": False, "note": f"Jev 실패({type(e).__name__}) — 숫자 기준만 적용"}
@@ -580,17 +717,23 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
 
     for p in passed:
         p["score"], p["score_parts"] = composite(p, maxes, use)
+    for p in passed:   # Jev 가 못 본 곳(40곳 밖·키 없음)도 이름 목록으로는 가른다
+        p["chain"] = bool(p.get("chain")) or is_chain_brand(p["name"])
     # 배수가 주 규칙(회장님 2026-09-25): 배수 통과가 먼저, 비율로만 붙은 곳은 그 뒤를 채운다
     passed.sort(key=lambda p: ("배수" not in p["pass_by"], -p["score"]))
-    groups = {name: [p for p in passed if p["group"] == name][:GROUP_TOP] for name, _ in GROUPS}
+    # 숨은 맛집에는 체인점을 넣지 않는다(③) — 체인은 리뷰 수와 무관하게 '숨은' 곳이 아니다
+    groups = {name: [p for p in passed if p["group"] == name and not (name == "숨은 맛집" and p.get("chain"))]
+              [:GROUP_MORE] for name, _ in GROUPS}
     for p in passed:
         p.pop("reviews", None)  # 출력에는 리뷰 원문을 싣지 않는다
+        p.pop("review_dates", None)
         p["keywords"] = p.get("keywords", [])[:6]
         p["menus"] = p.get("menus", [])[:6]
         p.pop("newBusinessHours", None)
         p.pop("priceCategory", None)
     return {"area": area, "food_type": food_type, "want": want, "menu": menu,
-            "filters": {"open_now": open_now, "max_price_manwon": max_price},
+            "filters": {"open_now": open_now, "max_price_manwon": max_price, "meal": meal,
+                        "near": list(near) if near else None},
             "rule": {"min_votes": min_votes, "ratio": ratio, "ratio_low_reviews": ratio * 1.5,
                      "share_min": SHARE_MIN},
             "query": query, "naver_total": total, "cached": cached,
@@ -622,7 +765,7 @@ def format_text(res):
     for title, items in sections:
         if title:
             out.append(title)
-        out += [format_place(n, p) for n, p in enumerate(items, 1)]
+        out += [format_place(n, p) for n, p in enumerate(items[:GROUP_TOP], 1)]
     if res["checked"] == 0:
         out.append(f"'{res['query']}' 검색 결과에서 식당을 찾지 못했다."
                    + (f" ({'; '.join(res['errors'])})" if res["errors"] else ""))
@@ -644,6 +787,10 @@ def review_flags(p, details=True):
         out.append("⏱웨이팅 길다는 리뷰")
     if (p.get("jev_event") or 0) >= REVIEW_FLAG:
         out.append("🎁리뷰 이벤트 리뷰 많음")
+    if p.get("surge"):
+        out.append("📈최근 리뷰 급증(새 가게·이벤트 가능)")
+    if p.get("chain"):
+        out.append("🏷체인점")
     if details:
         out += [f"{icon}{d} 언급" for d, icon in p.get("details") or []]
     return out
@@ -674,7 +821,8 @@ def format_place(n, p):
     if p.get("opposite_evidence"):
         extra.append("감점: " + ", ".join(f"{k} {c}표" for k, c in p["opposite_evidence"][:2]))
     extra += review_flags(p)
-    info = " · ".join(x for x in (p.get("status"), p.get("price")) if x)
+    walk = f"걸어서 {p['walk_min']}분" if p.get("walk_min") else ""
+    info = " · ".join(x for x in (walk, p.get("status"), p.get("status_desc"), p.get("price")) if x)
     out.append(line)
     if extra:
         out.append("   " + " · ".join(extra))
@@ -684,7 +832,7 @@ def format_place(n, p):
 
 def main():
     ap = argparse.ArgumentParser(description="네이버 플레이스 맛집 추리기")
-    ap.add_argument("area", nargs="+", help="지역(예: 성수동)")
+    ap.add_argument("area", nargs="*", help="지역(예: 성수동). --near 면 생략 가능")
     ap.add_argument("--type", default="", help="음식 종류(예: 한식, 고깃집)")
     ap.add_argument("--want", default="", help="조건(예: 조용히 대화하기 좋은 곳) — Jev 판정에 씀")
     ap.add_argument("--menu", default="", help="찾는 메뉴(예: 크림파스타) — 리뷰 메뉴 언급으로 거름")
@@ -694,11 +842,16 @@ def main():
     ap.add_argument("--ratio", type=float, default=2.0)
     ap.add_argument("--top", type=int, default=5)
     ap.add_argument("--max-places", type=int, default=100, help="조회할 식당 수(최대 200)")
+    ap.add_argument("--near", metavar="위도,경도", help="이 좌표 주변(1.5km)에서 찾는다. 지역은 생략 가능")
+    ap.add_argument("--meal", choices=MEAL_WORDS, help="끼니(오늘 쉬는 곳을 뺀다)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--card", metavar="PNG", help="결과를 네이버 플레이스 목록 같은 카드 PNG 로도 저장(playwright 필요)")
     a = ap.parse_args()
+    near = tuple(float(x) for x in a.near.split(",")) if a.near else None
+    if not a.area and not near:
+        ap.error("지역 또는 --near 가 필요하다")
     res = recommend(" ".join(a.area), a.type, a.want, a.menu, a.open_now, a.max_price,
-                    a.min_votes, a.ratio, a.top, max(1, min(a.max_places, 200)))
+                    a.min_votes, a.ratio, a.top, max(1, min(a.max_places, 200)), near, a.meal or "")
     print(json.dumps(res, ensure_ascii=False, indent=1) if a.json else format_text(res))
     if a.card:
         try:
