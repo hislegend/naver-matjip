@@ -181,3 +181,7 @@ Korean restaurant finder for AI agents (filters: menu mentions, open now, price 
 ## License
 
 MIT
+
+### 웹 페이지 (개인 서버, 선택)
+
+`web/server.py` 는 한 줄 입력(«을지로 노포 한식 3만원 이하»)을 받아 카드 목록을 보여주는 작은 페이지다. 표준 라이브러리만 쓰고, 기본으로 테일스케일 주소에만 열리며 테일스케일·로컬 요청만 받는다. 사파리 «홈 화면에 추가 / Dock에 추가»로 앱처럼 쓸 수 있다(manifest·아이콘 포함). 상시 실행용 LaunchAgent 예시는 `web/com.crabs.matjip-web.plist.example`.

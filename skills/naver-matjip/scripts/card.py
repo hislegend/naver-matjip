@@ -19,11 +19,12 @@ CSS = """
         --green:#03c75a; --red:#ff5a5f; --amber:#f5a524; }
 * { box-sizing:border-box; margin:0; padding:0; }
 body { background:var(--bg); color:var(--text); width:%dpx; padding:14px 12px 16px;
-       font-family:"Apple SD Gothic Neo","Pretendard","Noto Sans KR",sans-serif; font-size:15px; line-height:1.4; }
+       font-family:"Apple SD Gothic Neo","Pretendard","Noto Sans KR",sans-serif; font-size:15px; line-height:1.4; word-break:keep-all; }
 .head { padding:2px 4px 12px; }
 .head h1 { font-size:19px; font-weight:800; }
 .head h1 b { color:var(--green); }
 .head p { color:var(--sub); font-size:13px; margin-top:3px; }
+a.card { color:inherit; text-decoration:none; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px;
         display:flex; gap:12px; margin-bottom:10px; }
 .ph { position:relative; flex:0 0 96px; height:96px; border-radius:10px; overflow:hidden; background:#262a2f; }
@@ -50,6 +51,11 @@ body { background:var(--bg); color:var(--text); width:%dpx; padding:14px 12px 16
 """ % WIDTH
 
 
+def thumb_url(url):
+    """브라우저가 직접 불러올 썸네일 주소(웹 페이지용)."""
+    return THUMB.format(src=urllib.parse.quote(url, safe="")) if url else None
+
+
 def _image(url):
     """썸네일(없으면 원본)을 data URI 로. 실패하면 None — 사진 없이 그린다."""
     if not url:
@@ -66,9 +72,9 @@ def _image(url):
     return None
 
 
-def _card(n, p, img):
+def _card(n, p, img, link=False):
     e = html.escape
-    ph = f'<img src="{img}">' if img else '<div class="no">🍽️</div>'
+    ph = f'<img src="{e(img)}" loading="lazy">' if img else '<div class="no">🍽️</div>'
     rating = f'<span class="star">★</span> <b>{p["rating"]}</b> · ' if p.get("rating") else ""
     reviews = f'방문자리뷰 {p["review_total"]:,}' if p.get("review_total") else ""
     st = p.get("status") or ""
@@ -83,31 +89,46 @@ def _card(n, p, img):
     if p.get("opposite_evidence"):
         ev.append("👎 " + ", ".join(f"{e(k)} {c:,}표" for k, c in p["opposite_evidence"][:1]))
     warn = '<div class="warn">⚠️ 협찬 리뷰 의심</div>' if p.get("sponsored_flag") else ""
-    return f"""<div class="card"><div class="ph">{ph}<div class="rank">{n}</div></div><div class="body">
+    tag, end = (f'<a class="card" href="{e(p["url"])}" target="_blank" rel="noopener">', "</a>") if link \
+        else ('<div class="card">', "</div>")
+    return f"""{tag}<div class="ph">{ph}<div class="rank">{n}</div></div><div class="body">
 <div class="t"><span class="name">{e(p["name"])}</span><span class="cat">{e(p.get("category") or "")}</span>
 <span class="score">{p["score"]:.0f}점</span></div>
 <div class="row">{rating}{reviews}</div>
 <div class="taste">😋 {e(p["taste_key"])} <b>{p["taste_votes"]:,}표</b> · 2위의 {p["ratio"]:.1f}배</div>
 {"".join(f'<div class="ev">{x}</div>' for x in ev)}{warn}
-<div class="row">{info}</div></div></div>"""
+<div class="row">{info}</div></div>{end}"""
 
 
-def build_html(res, sponsored_cut=0.7):
-    e = html.escape
-    items = res.get("results") or []
-    for p in items:
-        p["sponsored_flag"] = (p.get("jev_sponsored") or 0) >= sponsored_cut
-    with cf.ThreadPoolExecutor(6) as ex:
-        imgs = list(ex.map(lambda p: _image(p.get("imageUrl")), items))
-    title = e(res.get("query") or "")
+def summary(res):
+    """결과 머리 한 줄(통과 수·조건·Jev 상태)."""
     sub = [f'네이버 상위 {res.get("checked", 0)}곳 중 {res.get("passed_count", 0)}곳 통과',
            (res.get("jev") or {}).get("note", "")]
     if res.get("want"):
         sub.insert(1, f'조건: {res["want"]}')
-    cards = "".join(_card(n, p, i) for n, (p, i) in enumerate(zip(items, imgs), 1)) \
+    return " · ".join(s for s in sub if s)
+
+
+def cards_html(res, sponsored_cut=0.7, web=False):
+    """카드 목록 HTML 조각. web=True 면 카드가 링크가 되고 사진은 브라우저가 직접 불러온다."""
+    items = res.get("results") or []
+    for p in items:
+        p["sponsored_flag"] = (p.get("jev_sponsored") or 0) >= sponsored_cut
+    if web:
+        imgs = [thumb_url(p.get("imageUrl")) for p in items]
+    else:
+        with cf.ThreadPoolExecutor(6) as ex:
+            imgs = list(ex.map(lambda p: _image(p.get("imageUrl")), items))
+    return "".join(_card(n, p, i, link=web) for n, (p, i) in enumerate(zip(items, imgs), 1)) \
         or '<div class="empty">기준을 통과한 곳이 없습니다.</div>'
+
+
+def build_html(res, sponsored_cut=0.7):
+    e = html.escape
+    title = e(res.get("query") or "")
+    cards = cards_html(res, sponsored_cut)
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{CSS}</style></head><body>
-<div class="head"><h1><b>N</b> {title}</h1><p>{" · ".join(e(s) for s in sub if s)}</p></div>
+<div class="head"><h1><b>N</b> {title}</h1><p>{e(summary(res))}</p></div>
 {cards}</body></html>"""
 
 
