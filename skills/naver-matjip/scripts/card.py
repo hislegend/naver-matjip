@@ -48,6 +48,8 @@ a.card { color:inherit; text-decoration:none; }
 .closed { color:var(--red); font-weight:700; }
 .warn { color:var(--red); font-size:12.5px; font-weight:700; margin-top:3px; }
 .empty { color:var(--sub); padding:24px 4px; text-align:center; }
+.grp { font-size:15px; font-weight:800; margin:14px 4px 8px; }
+.grp span { color:var(--sub); font-size:12px; font-weight:500; margin-left:6px; }
 """ % WIDTH
 
 
@@ -88,16 +90,32 @@ def _card(n, p, img, link=False):
         ev.append("🍴 " + ", ".join(f"{e(k)} {c:,}회" for k, c in p["menu_evidence"][:2]))
     if p.get("opposite_evidence"):
         ev.append("👎 " + ", ".join(f"{e(k)} {c:,}표" for k, c in p["opposite_evidence"][:1]))
-    warn = '<div class="warn">⚠️ 협찬 리뷰 의심</div>' if p.get("sponsored_flag") else ""
+    from matjip import review_flags  # 늦은 import — matjip 이 card 를 main 에서만 부른다
+    flags = review_flags(p, details=False)
+    if p.get("details"):
+        ev.append(" · ".join(f"{icon} {e(d)} 언급" for d, icon in p["details"]))
+    warn = f'<div class="warn">{" · ".join(e(x) for x in flags)}</div>' if flags else ""
     tag, end = (f'<a class="card" href="{e(p["url"])}" target="_blank" rel="noopener">', "</a>") if link \
         else ('<div class="card">', "</div>")
     return f"""{tag}<div class="ph">{ph}<div class="rank">{n}</div></div><div class="body">
 <div class="t"><span class="name">{e(p["name"])}</span><span class="cat">{e(p.get("category") or "")}</span>
 <span class="score">{p["score"]:.0f}점</span></div>
 <div class="row">{rating}{reviews}</div>
-<div class="taste">😋 {e(p["taste_key"])} <b>{p["taste_votes"]:,}표</b> · 2위의 {p["ratio"]:.1f}배</div>
+<div class="taste">😋 {e(p["taste_key"])} <b>{p["taste_votes"]:,}표</b> · {e(taste_reason(p))}</div>
 {"".join(f'<div class="ev">{x}</div>' for x in ev)}{warn}
 <div class="row">{info}</div></div>{end}"""
+
+
+def taste_reason(p):
+    """배수로 붙었으면 "2위의 N배", 비율로 붙었으면 "방문자 N%"(둘 다면 둘 다)."""
+    by = p.get("pass_by") or []
+    bits = [f'2위의 {p["ratio"]:.1f}배'] if "배수" in by else []
+    if "비율" in by or not bits:
+        bits.append(f'방문자 {p.get("share", 0):.0%}')
+    return " · ".join(bits)
+
+
+GROUP_NOTE = {"대형 맛집": "리뷰 1만+", "검증된 맛집": "리뷰 1천~1만", "숨은 맛집": "리뷰 1천 미만"}
 
 
 def summary(res):
@@ -111,7 +129,14 @@ def summary(res):
 
 def cards_html(res, sponsored_cut=0.7, web=False):
     """카드 목록 HTML 조각. web=True 면 카드가 링크가 되고 사진은 브라우저가 직접 불러온다."""
-    items = res.get("results") or []
+    groups = res.get("groups") or {}
+    if groups:   # 리뷰 수 그룹별로 제목을 달고 그룹 안에서 번호를 다시 매긴다
+        items = [p for ps in groups.values() for p in ps]
+        heads = {id(ps[0]): name for name, ps in groups.items()}
+        nums = [n for ps in groups.values() for n in range(1, len(ps) + 1)]
+    else:
+        items = res.get("results") or []
+        heads, nums = {}, list(range(1, len(items) + 1))
     for p in items:
         p["sponsored_flag"] = (p.get("jev_sponsored") or 0) >= sponsored_cut
     if web:
@@ -119,7 +144,10 @@ def cards_html(res, sponsored_cut=0.7, web=False):
     else:
         with cf.ThreadPoolExecutor(6) as ex:
             imgs = list(ex.map(lambda p: _image(p.get("imageUrl")), items))
-    return "".join(_card(n, p, i, link=web) for n, (p, i) in enumerate(zip(items, imgs), 1)) \
+    def head(p):
+        g = heads.get(id(p))
+        return f'<div class="grp">{html.escape(g)}<span>{GROUP_NOTE.get(g, "")}</span></div>' if g else ""
+    return "".join(head(p) + _card(n, p, i, link=web) for n, p, i in zip(nums, items, imgs)) \
         or '<div class="empty">기준을 통과한 곳이 없습니다.</div>'
 
 
