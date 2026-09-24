@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""matjip 웹 — 한 줄로 맛집을 묻고 카드로 받는 작은 페이지 (테일스케일 전용).
+"""matjip 웹 — 한 줄로 맛집을 묻고 카드로 받는 작은 페이지 (사설망 전용 권장).
 
-  python3 web/server.py                      # 기본: 100.76.132.49:8787
-  MATJIP_WEB_HOST=127.0.0.1 python3 web/server.py
+  python3 web/server.py                      # 기본: 127.0.0.1:8787
+  MATJIP_WEB_HOST=<테일스케일 IP> python3 web/server.py   # 폰에서 쓰려면 사설망 주소로 (공인 IP 금지)
 
 - 입력 문장은 규칙으로 지역·음식·메뉴·가격·조건으로 나눈다(즉시). 조건은 matjip 의 Jev 가 해석한다.
   (claude CLI 해석은 서버에서 20초+ 걸리고 봇 설정 파일을 건드려 뺐다 — 2026-09-24)
@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "skills", "naver-matjip", "scripts")
 import card    # noqa: E402
 import matjip  # noqa: E402
 
-HOST = os.environ.get("MATJIP_WEB_HOST", "100.76.132.49")
+HOST = os.environ.get("MATJIP_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MATJIP_WEB_PORT", "8787"))
 ALLOWED = [ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("127.0.0.0/8")]
 RUN_LOCK = threading.Lock()
