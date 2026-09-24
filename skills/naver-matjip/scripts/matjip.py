@@ -29,7 +29,7 @@ JEV_URL = os.environ.get("JEV_API_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_KEY_FILE = os.path.expanduser("~/.config/jev/api_key")
 
 Q_LIST = ("query getRestaurants($input: RestaurantListInput) { restaurants: restaurantList(input: $input) "
-          "{ total items { id name category priceCategory roadAddress imageUrl newBusinessHours { status description } } } }")
+          "{ total items { id name category priceCategory roadAddress address imageUrl newBusinessHours { status description } } } }")
 Q_STATS = ("query stats($id: String, $businessType: String) { visitorReviewStats(input: "
            "{businessId: $id, businessType: $businessType}) { id review { avgRating totalCount } "
            "analysis { votedKeyword { details { displayName count } } menus { label count } } } }")
@@ -86,7 +86,7 @@ def cache_key(*parts):
 
 def load_places(query, limit):
     """목록 + 키워드·메뉴 통계. 24시간 캐시. (total, places, from_cache)"""
-    name = "places2-" + cache_key(query, limit)  # places2: imageUrl 추가 후 캐시
+    name = "places3-" + cache_key(query, limit)  # places3: 지번 주소(동) 추가 후 캐시
     hit = cache_get(name)
     if hit:
         return hit["total"], hit["places"], True
@@ -280,21 +280,76 @@ def condition_score(place, weights):
     return score, sorted([h for h in hits if h[1] >= 5], key=lambda x: -x[1])
 
 
-def judge_sponsored(cands, key):
-    """식당마다 최근 리뷰로 체험단·협찬 위주인지 판정(식당당 1요청, 병렬). {id: 확률}."""
-    q = {"sponsored": {
+UNFIT_CUT = 0.7     # 업종이 조건과 안 맞을 확률이 이 이상이면 뺀다
+REVIEW_FLAG = 0.7   # 리뷰 판정(이벤트·맛 변함·웨이팅·세부) 표시 기준
+# 조건 세부 확인(⑤)에 쓸 보기. Jev 가 조건에 중요한 것만 고른다(최대 DETAIL_MAX).
+DETAILS = {"아기의자": "👶", "놀이방·키즈존": "🧸", "주차": "🅿️", "룸·개별 공간": "🚪", "단체석": "👥",
+           "조용한 분위기": "🤫", "반려견(강아지) 동반": "🐶", "혼자 앉기 좋은 바 좌석": "🪑", "콘센트·노트북": "💻",
+           "창밖 뷰·야경": "🌃", "예약": "📅", "휠체어·유모차 출입": "♿", "무한리필": "♾️", "포장": "🥡"}
+DETAIL_MAX = 3
+
+
+def category_unfit(want, categories, key):
+    """업종 이름만 보고 조건과 안 맞는 업종을 고른다(①). {업종: 확률}"""
+    q = {f"c{i}": {
         "type": "noul",
-        "instructions": "`recent_reviews` 가 체험단·협찬·이벤트 참여로 쓴 리뷰 위주인가?",
-        "criteria": {
-            "true": "제공받음·체험단·이벤트 참여·과장된 홍보 문구가 반복되는 리뷰가 절반 이상이다",
-            "false": "대부분 직접 방문한 손님의 평범한 후기다",
-        },
-    }}
+        "instructions": f"'{c}' 업종 식당은 손님의 요청(`customer_request`)에 어울리지 않는 곳인가?",
+        "criteria": {"true": f"'{c}' 는 요청한 상황에 맞지 않는 업종이다(예: 아이와 가려는데 술집)",
+                     "false": f"'{c}' 업종이라는 것만으로 요청과 충돌하지 않는다"},
+    } for i, c in enumerate(categories)}
+    ans = jev_call({"customer_request": want}, q, key)
+    return {c: ans[f"c{i}"]["noul"] for i, c in enumerate(categories)}
+
+
+def pick_details(want, key):
+    """조건에 중요한 세부 정보 보기를 고른다(⑤). [보기, …]"""
+    names = list(DETAILS)
+    q = {f"d{i}": {
+        "type": "noul",
+        "instructions": f"손님의 요청(`customer_request`)대로 식당을 고를 때 '{d}' 여부가 중요한 정보인가?"
+                        f" 요청에 없는 동행자(예: 아이와 간다는데 반려견)는 중요하지 않다.",
+        "criteria": {"true": f"'{d}' 는 이 손님에게 꼭 알려줘야 할 정보다",
+                     "false": f"'{d}' 는 이 요청과 별 관계없다"},
+    } for i, d in enumerate(names)}
+    ans = jev_call({"customer_request": want}, q, key)
+    ranked = sorted(((ans[f"d{i}"]["noul"], d) for i, d in enumerate(names)), reverse=True)
+    return [d for v, d in ranked if v >= 0.6][:DETAIL_MAX]
+
+
+def judge_reviews(cands, key, details=()):
+    """식당마다 최근 리뷰로 한 번에 판정한다(식당당 1요청, 병렬). {id: {질문: 확률}}
+    협찬 · 리뷰 이벤트(②보강) · 맛 변함(②) · 웨이팅(③) · 조건 세부(⑤)."""
+    q = {
+        "sponsored": {"type": "noul",
+                      "instructions": "`recent_reviews` 가 체험단·협찬으로 쓴 리뷰 위주인가?",
+                      "criteria": {"true": "제공받음·체험단·과장된 홍보 문구가 반복되는 리뷰가 절반 이상이다",
+                                   "false": "대부분 직접 방문한 손님의 평범한 후기다"}},
+        "event": {"type": "noul",
+                  "instructions": "`recent_reviews` 에 리뷰 이벤트(리뷰 쓰면 음료·서비스 제공)에 참여해 쓴 리뷰가 많은가?",
+                  "criteria": {"true": "리뷰 이벤트·서비스 받고 작성했다는 리뷰가 여러 건이다",
+                               "false": "리뷰 이벤트 참여를 밝힌 리뷰가 거의 없다"}},
+        "declined": {"type": "noul",
+                     "instructions": "`recent_reviews` 에 예전보다 맛이나 서비스가 나빠졌다는 말이 여러 건 있는가?",
+                     "criteria": {"true": "예전만 못하다·맛이 변했다·주인이 바뀌었다 같은 불만이 둘 이상이다",
+                                  "false": "그런 말이 없거나 한 건뿐이다"}},
+        "waiting": {"type": "noul",
+                    "instructions": "`recent_reviews` 에 웨이팅(대기)이 길다는 말이 여러 건 있는가?",
+                    "criteria": {"true": "30분 넘게 기다렸다·줄이 길다는 리뷰가 둘 이상이다",
+                                 "false": "대기 얘기가 없거나 짧았다고 한다"}},
+    }
+    for i, d in enumerate(details):
+        q[f"d{i}"] = {"type": "noul",
+                      "instructions": f"`recent_reviews` 에 이 식당에 '{d}' 이(가) 있다·좋았다는 언급이 있는가?",
+                      "criteria": {"true": f"'{d}' 가 있다·편했다는 방문자 문장이 있다",
+                                   "false": f"'{d}' 언급이 없거나 없다·불편했다고 한다"}}
 
     def one(c):
         if not c.get("reviews"):
-            return c["id"], None
-        return c["id"], jev_call({"recent_reviews": [r[:300] for r in c["reviews"][:8]]}, q, key)["sponsored"]["noul"]
+            return c["id"], {}
+        ans = jev_call({"recent_reviews": [r[:250] for r in c["reviews"][:12]]}, q, key)
+        out = {k: ans[k]["noul"] for k in ("sponsored", "event", "declined", "waiting")}
+        out["details"] = [d for i, d in enumerate(details) if ans[f"d{i}"]["noul"] >= REVIEW_FLAG]
+        return c["id"], out
 
     with cf.ThreadPoolExecutor(8) as ex:
         return dict(ex.map(one, cands))
@@ -314,6 +369,18 @@ GROUP_TOP = 3
 COND_MIN_VOTES = 10
 
 
+def area_filter(places, area):
+    """지번 주소의 동 이름이 지역과 맞는 곳만(⑦ 옆 동네 거르기). 지역이 동 이름이 아니면(예: 강남역·홍대)
+    맞는 곳이 30% 미만이라 거르지 않는다. (남길 목록, 뺀 수)"""
+    core = re.sub(r"(동|역|구|시|읍|면)$", "", area.split()[0]) if area else ""
+    if len(core) < 2:
+        return places, 0
+    hit = [p for p in places if (p.get("address") or "").split(" ")[0].startswith(core)]
+    if len(hit) < 0.3 * len(places):
+        return places, 0
+    return hit, len(places) - len(hit)
+
+
 def review_group(n):
     return next(name for name, lo in GROUPS if (n or 0) >= lo)
 
@@ -330,6 +397,7 @@ def taste_pass(p, ratio):
 # 종합 점수 가중치(코드가 정한다 — 공식 권장 "Composite scoring"). 양수 항목은 쓰이는 것끼리 합이 1이 되게 다시 나눈다.
 WEIGHTS = {"맛": 0.45, "별점": 0.2, "표 규모": 0.15, "조건": 0.5, "리뷰 문장": 0.25, "메뉴": 0.35}
 PENALTY = 0.2          # 반대 키워드 감점 가중치
+OPP_FULL = 0.25        # 반대 키워드 표가 전체 표의 이 비중이면 감점 최대
 SPONSORED_CUT = 0.7    # 협찬 의심 이상이면 점수 ×0.6
 
 
@@ -361,13 +429,18 @@ def composite(c, maxes, use):
     wsum = sum(WEIGHTS[k] for k in parts)
     pts = {k: 100 * WEIGHTS[k] / wsum * v for k, v in parts.items()}
     total = sum(pts.values())
-    if c.get("opposite_score") and maxes["조건"]:
-        pen = 100 * PENALTY * min(c["opposite_score"] / maxes["조건"], 1.0)
+    if c.get("opposite_score"):
+        # 반대 표 비중 자체로 감점(전체 표의 OPP_FULL 이상이면 최대). 예전엔 조건 최고점으로 나눠
+        # 조건 표가 적은 지역(아이랑 30표)에선 반대 표가 조금만 있어도 최대 감점이 됐다(맥도날드 31점).
+        pen = 100 * PENALTY * min(c["opposite_score"] / OPP_FULL, 1.0)
         pts["반대 감점"] = -pen
         total -= pen
     if (c.get("jev_sponsored") or 0) >= SPONSORED_CUT:
         pts["협찬 의심"] = -0.4 * total
         total *= 0.6
+    if (c.get("jev_declined") or 0) >= REVIEW_FLAG:
+        pts["맛 변함 의심"] = -0.2 * total
+        total *= 0.8
     return round(max(total, 0), 1), {k: round(v, 1) for k, v in pts.items()}
 
 
@@ -382,13 +455,15 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
     except Exception as e:
         total, places, cached = 0, [], False
         errors.append(f"조회 실패: {type(e).__name__} {e}")
+    listed = len(places)
+    places, off_area = area_filter(places, area)
     for p in places:
         p["url"] = f"https://m.place.naver.com/restaurant/{p['id']}/home"
         p["status"] = ((p.get("newBusinessHours") or {}).get("status")) or None
         p["price"] = p.get("priceCategory")
 
-    excluded = {"카페": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
-                "메뉴 언급 없음": 0, "조건 근거 없음": 0}
+    excluded = {"옆 동네": off_area, "카페": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
+                "메뉴 언급 없음": 0, "조건 근거 없음": 0, "업종이 조건과 안 맞음": 0, "이벤트 리뷰로 부푼 비율": 0}
     passed = []
     no_cafe = not food_type and not menu   # "맛집"만 물으면 카페는 뺀다
     for p in places:
@@ -441,6 +516,17 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
                         c["review_fit"] = fits.get(c["id"])
                     use.add("리뷰 문장")
                     notes.append(f"'{want}' 에 딱 맞는 네이버 키워드가 없어(최고 {max(rel.values()):.2f}) 리뷰 문장으로 보조 판정")
+                if want:
+                    unfit = category_unfit(want, sorted({c.get("category") or "" for c in cands} - {""}), k)
+                    keep = [c for c in cands if unfit.get(c.get("category") or "", 0) < UNFIT_CUT]
+                    excluded["업종이 조건과 안 맞음"] = len(cands) - len(keep)
+                    bad = sorted(u for u, v in unfit.items() if v >= UNFIT_CUT)
+                    if bad:
+                        notes.append(f"'{want}' 에 안 맞는 업종 제외: {', '.join(bad)}")
+                    cands = keep
+                    passed = keep + passed[JEV_MAX:]
+                if "리뷰 문장" in use:
+                    pass
                 elif want_keywords:
                     # 키워드로 판정되는 조건이면 근거 표가 있는 곳만 남긴다
                     keep = [c for c in cands if any(n >= COND_MIN_VOTES for _, n in c["condition_evidence"])]
@@ -465,9 +551,24 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
                 maxes["메뉴"] = max([c["menu_share"] for c in cands] or [0])
                 use.add("메뉴")
             fetch_reviews(cands)
-            spons = judge_sponsored(cands, k)
+            details = pick_details(want, k) if want else []
+            judged = judge_reviews(cands, k, details)
+            keep = []
             for c in cands:
-                c["jev_sponsored"] = spons.get(c["id"])
+                j = judged.get(c["id"]) or {}
+                c["jev_sponsored"] = j.get("sponsored")
+                c["jev_event"], c["jev_declined"], c["jev_waiting"] = j.get("event"), j.get("declined"), j.get("waiting")
+                c["details"] = [(d, DETAILS[d]) for d in j.get("details", [])]
+                # 리뷰 이벤트가 많으면 방문자 비율이 부풀므로 비율 통과를 인정하지 않는다(배수 통과만)
+                if (c["jev_event"] or 0) >= REVIEW_FLAG and "비율" in c["pass_by"]:
+                    c["pass_by"] = [x for x in c["pass_by"] if x != "비율"]
+                    if not c["pass_by"]:
+                        excluded["이벤트 리뷰로 부푼 비율"] += 1
+                        continue
+                keep.append(c)
+            gone = {c["id"] for c in cands} - {c["id"] for c in keep}
+            passed = [p for p in passed if p["id"] not in gone]
+            cands = keep
             jev = {"used": True, "note": f"Jev 판정 적용({len(cands)}곳)"}
         except Exception as e:
             jev = {"used": False, "note": f"Jev 실패({type(e).__name__}) — 숫자 기준만 적용"}
@@ -490,7 +591,7 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
                      "share_min": SHARE_MIN},
             "query": query, "naver_total": total, "cached": cached,
             "want_keywords": want_keywords, "opposite_keywords": opposite_keywords, "menu_labels": menu_labels,
-            "checked": len(places), "passed_count": len(passed), "results": passed[:top],
+            "checked": listed, "passed_count": len(passed), "results": passed[:top],
             "groups": {k: v for k, v in groups.items() if v},
             "excluded": {k: v for k, v in excluded.items() if v}, "jev": jev, "notes": notes,
             "errors": errors, "seconds": round(time.time() - t0, 1)}
@@ -528,6 +629,22 @@ def format_text(res):
     return "\n".join(out)
 
 
+def review_flags(p, details=True):
+    """리뷰 판정 표시(카드·텍스트 공용)."""
+    out = []
+    if (p.get("jev_sponsored") or 0) >= SPONSORED_CUT:
+        out.append("⚠️협찬 리뷰 의심")
+    if (p.get("jev_declined") or 0) >= REVIEW_FLAG:
+        out.append("⚠️요즘 맛·서비스가 변했다는 리뷰")
+    if (p.get("jev_waiting") or 0) >= REVIEW_FLAG:
+        out.append("⏱웨이팅 길다는 리뷰")
+    if (p.get("jev_event") or 0) >= REVIEW_FLAG:
+        out.append("🎁리뷰 이벤트 리뷰 많음")
+    if details:
+        out += [f"{icon}{d} 언급" for d, icon in p.get("details") or []]
+    return out
+
+
 def taste_reason(p):
     """통과 사유 한 줄 — 배수로 붙었는지, 비율로 붙었는지."""
     bits = []
@@ -552,8 +669,7 @@ def format_place(n, p):
         extra.append("메뉴: " + ", ".join(f"{k} {c}회" for k, c in p["menu_evidence"][:3]))
     if p.get("opposite_evidence"):
         extra.append("감점: " + ", ".join(f"{k} {c}표" for k, c in p["opposite_evidence"][:2]))
-    if (p.get("jev_sponsored") or 0) >= SPONSORED_CUT:
-        extra.append("⚠️협찬 리뷰 의심")
+    extra += review_flags(p)
     info = " · ".join(x for x in (p.get("status"), p.get("price")) if x)
     out.append(line)
     if extra:

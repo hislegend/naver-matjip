@@ -90,7 +90,11 @@ def _card(n, p, img, link=False):
         ev.append("🍴 " + ", ".join(f"{e(k)} {c:,}회" for k, c in p["menu_evidence"][:2]))
     if p.get("opposite_evidence"):
         ev.append("👎 " + ", ".join(f"{e(k)} {c:,}표" for k, c in p["opposite_evidence"][:1]))
-    warn = '<div class="warn">⚠️ 협찬 리뷰 의심</div>' if p.get("sponsored_flag") else ""
+    from matjip import review_flags  # 늦은 import — matjip 이 card 를 main 에서만 부른다
+    flags = review_flags(p, details=False)
+    if p.get("details"):
+        ev.append(" · ".join(f"{icon} {e(d)} 언급" for d, icon in p["details"]))
+    warn = f'<div class="warn">{" · ".join(e(x) for x in flags)}</div>' if flags else ""
     tag, end = (f'<a class="card" href="{e(p["url"])}" target="_blank" rel="noopener">', "</a>") if link \
         else ('<div class="card">', "</div>")
     return f"""{tag}<div class="ph">{ph}<div class="rank">{n}</div></div><div class="body">

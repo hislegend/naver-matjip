@@ -61,7 +61,39 @@ def parse_query(q):
         elif w not in DROP:
             rest.append(w)
     opt["want"] = " ".join(rest)
+    if rest:
+        jev_refine(opt, rest)
     return opt
+
+
+def jev_refine(opt, words):
+    """규칙이 '조건'으로 남긴 낱말을 Jev 가 메뉴 / 조건 / 군더더기 중 하나로 다시 가른다(④).
+    예) '문정 점심 맛집' → '점심'은 시간대라 뺀다. Jev 가 없거나 실패하면 규칙 결과 그대로."""
+    k = matjip.jev_key()
+    if not k:
+        return
+    q = {}
+    for i, w in enumerate(words):
+        q[f"m{i}"] = {"type": "noul", "instructions": f"맛집 검색 문장(`request`) 속 낱말 '{w}' 는 먹고 싶은 음식·메뉴 이름인가?",
+                      "criteria": {"true": f"'{w}' 는 음식·메뉴 이름이다", "false": f"'{w}' 는 음식 이름이 아니다"}}
+        q[f"c{i}"] = {"type": "noul", "instructions": f"맛집 검색 문장(`request`) 속 낱말 '{w}' 는 식당을 고르는 조건"
+                                                        f"(누구와·분위기·상황·목적)을 나타내는가?",
+                      "criteria": {"true": f"'{w}' 는 식당 선택 조건(예: 아이랑, 조용한, 회식, 데이트)이다",
+                                   "false": f"'{w}' 는 식사 시간대(점심·저녁)·말버릇·군더더기 등 식당 선택과 무관한 말이다"}}
+    try:
+        ans = matjip.jev_call({"request": " ".join(words)}, q, k)
+    except Exception:
+        return
+    keep, dropped = [], []
+    for i, w in enumerate(words):
+        pm, pc = ans[f"m{i}"]["noul"], ans[f"c{i}"]["noul"]
+        if pm >= 0.6 and pm > pc and not opt["menu"] and not opt["type"]:
+            opt["menu"] = w
+        elif pc >= 0.5:
+            keep.append(w)
+        else:
+            dropped.append(w)
+    opt["want"], opt["dropped"], opt["by"] = " ".join(keep), dropped, "jev"
 
 
 def search(q, open_now):
@@ -135,7 +167,8 @@ $('f').onsubmit = async ev => {
     const p = d.parsed;
     const bits = [p.area, p.type, p.menu, p.want, p.max_price ? p.max_price + '만원 이하' : ''].filter(Boolean);
     $('out').innerHTML = '<div class="parsed">이렇게 이해했어요: <b>' + bits.map(esc).join(' / ') + '</b>'
-      + (p.open_now ? ' / 지금 영업 중' : '') + '<br>' + esc(d.summary)
+      + (p.open_now ? ' / 지금 영업 중' : '')
+      + (p.dropped && p.dropped.length ? ' (뺀 말: ' + p.dropped.map(esc).join(', ') + ')' : '') + '<br>' + esc(d.summary)
       + d.notes.map(n => '<br>' + esc(n)).join('') + ' · ' + d.seconds + '초</div>' + d.html;
   } catch (e) {
     $('out').innerHTML = '<div class="err">연결 실패 — 테일스케일이 켜져 있는지 확인해 주세요.</div>';
