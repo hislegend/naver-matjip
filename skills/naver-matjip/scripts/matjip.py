@@ -310,6 +310,8 @@ SHARE_MIN = 0.85
 # 리뷰 수 그룹 — 그룹마다 따로 추천한다.
 GROUPS = (("대형 맛집", 10000), ("검증된 맛집", LOW_REVIEWS), ("숨은 맛집", 0))
 GROUP_TOP = 3
+# 조건을 줬는데 그 조건 키워드 표가 이만큼도 없으면 뺀다(2026-09-25: "아이랑"에 근거 0표인 요리주점이 올라옴)
+COND_MIN_VOTES = 10
 
 
 def review_group(n):
@@ -386,7 +388,7 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
         p["price"] = p.get("priceCategory")
 
     excluded = {"카페": 0, "영업 안 함·정보 없음": 0, "가격 초과": 0, "투표 적음": 0, "맛 기준 미달": 0,
-                "메뉴 언급 없음": 0}
+                "메뉴 언급 없음": 0, "조건 근거 없음": 0}
     passed = []
     no_cafe = not food_type and not menu   # "맛집"만 물으면 카페는 뺀다
     for p in places:
@@ -431,7 +433,6 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
                 for c in cands:
                     c["condition_score"], c["condition_evidence"] = condition_score(c, want_keywords)
                     c["opposite_score"], c["opposite_evidence"] = condition_score(c, opposite_keywords)
-                maxes["조건"] = max(c["condition_score"] for c in cands)
                 use.add("조건")
                 if max(rel.values() or [0]) < VAGUE:
                     fetch_reviews(cands)
@@ -440,6 +441,13 @@ def recommend(area, food_type="", want="", menu="", open_now=False, max_price=No
                         c["review_fit"] = fits.get(c["id"])
                     use.add("리뷰 문장")
                     notes.append(f"'{want}' 에 딱 맞는 네이버 키워드가 없어(최고 {max(rel.values()):.2f}) 리뷰 문장으로 보조 판정")
+                elif want_keywords:
+                    # 키워드로 판정되는 조건이면 근거 표가 있는 곳만 남긴다
+                    keep = [c for c in cands if any(n >= COND_MIN_VOTES for _, n in c["condition_evidence"])]
+                    excluded["조건 근거 없음"] = len(cands) - len(keep) + len(passed[JEV_MAX:])
+                    cands = keep
+                    passed = keep
+                maxes["조건"] = max([c["condition_score"] for c in cands] or [0])
             if menu:
                 labels = {l for c in cands for l, _ in c.get("menus", [])[:30]}
                 menu_labels = match_menus(menu, labels, k) if labels else {}
